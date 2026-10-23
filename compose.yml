@@ -1,0 +1,249 @@
+# The Phantasy Star Universe server (PS2, US: PSU and Ambition of the Illuminus): docker compose up -d
+#
+# Settings come from .env (copy psu.env.example, or run python setup.py). Before the first start:
+#   docker network create openlobby          (the network an OpenLobby admin panel reaches the game on)
+#   docker compose run --rm -v /path/to/discs:/discs:ro extract --psu /discs/psu.iso --out /data
+#
+# What players reach (published on this machine; the discs' ports are fixed, the PSU_PORT_* settings
+# only move the published side for tests):
+#   patch   11110 PSU, 11140 AotI                       plain TCP
+#   ssl3    12110 PSU login, 12140 AotI login, 12061 game   SSLv3, forwarded in plain to login / game
+#   dns     53/udp (profile dns): the machine's shared DNS for consoles, when no other install runs one
+# login (22110, 22140) and game (22061) are only reachable from inside this project. Behind ssl3
+# every connection comes from the terminator, so the server never sees the players' own addresses
+# and does not need them.
+#
+# Host folders (each can be moved with its PSU_* setting):
+#   data/    game data built from your discs by extract: nbl/, gamedata/, captures/ (docs/data.md)
+#   state/   accounts and characters (psu.db), news.txt, events.json, update.json: back it up
+#   logs/    session logs, status.json, board/
+name: psu
+
+x-psu: &psu
+  build: server
+  image: psu-server:local
+  restart: unless-stopped
+  user: "${PSU_UID:-10110}:${PSU_GID:-10110}"
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+x-ssl3: &ssl3
+  image: ghcr.io/prettyopenlobby/openlobby-ssl3:${OPENLOBBY_TAG:-latest}
+  restart: unless-stopped
+  volumes:
+    - ssl3-certs:/certs
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "3"
+
+services:
+  patch:
+    <<: *psu
+    command: ["psu.patch"]
+    ports:
+      - "${PSU_PORT_PATCH_PSU:-11110}:11110"
+      - "${PSU_PORT_PATCH_AOTI:-11140}:11140"
+    volumes:
+      - ${PSU_LOGS:-./logs}:/logs
+    environment:
+      PSU_BIND: 0.0.0.0
+      PSU_PATCH_PORTS: "11110,11140"
+      PSU_IDLE_SECS: ${PSU_IDLE_SECS:-600}
+
+  login:
+    <<: *psu
+    command: ["psu.login"]
+    volumes:
+      - ${PSU_LOGS:-./logs}:/logs
+      - ${PSU_STATE:-./state}:/state
+    environment:
+      PSU_BIND: 0.0.0.0
+      # 22230 (the AotI PC login, experimental) only when ssl3-pc runs: 22110,22140,22230
+      PSU_LOGIN_PORTS: ${PSU_LOGIN_PORTS:-22110,22140}
+      # The game server's address login hands every client (0x0216): this machine as the players
+      # reach it. An IPv4 address, not a name.
+      PSU_GAME_ADDR: ${PSU_GAME_ADDR:?set PSU_GAME_ADDR in .env}
+      PSU_GAME_PORT: ${PSU_PORT_GAME:-12061}
+      PSU_AUTOREGISTER: ${PSU_AUTOREGISTER:-1}
+      PSU_LOGIN_FAIL_LIMIT: ${PSU_LOGIN_FAIL_LIMIT:-8}
+      PSU_MOTD: ${PSU_MOTD:-Welcome to the Phantasy Star Universe server.}
+      PSU_IDLE_SECS: ${PSU_IDLE_SECS:-600}
+
+  game:
+    <<: *psu
+    command: ["psu.game"]
+    volumes:
+      - ${PSU_LOGS:-./logs}:/logs
+      - ${PSU_STATE:-./state}:/state
+      - ${PSU_DATA:-./data}/nbl:/nbl:ro
+      - ${PSU_DATA:-./data}/captures:/captures:ro
+      - ${PSU_DATA:-./data}/gamedata:/gamedata:ro
+    environment:
+      PSU_BIND: 0.0.0.0
+      PSU_GAME_PORTS: "22061"
+      PSU_UNIVERSES: ${PSU_UNIVERSES:-1:Universe 1,2:Universe 2,3:Universe 3}
+      PSU_ADMINS: ${PSU_ADMINS:-}
+      PSU_IDLE_SECS: ${PSU_IDLE_SECS:-600}
+      PSU_SEASON: ${PSU_SEASON:-none}
+      PSU_SEASON_DROP: ${PSU_SEASON_DROP:-40}
+      PSU_NBL_EXTRA: ${PSU_NBL_EXTRA:-}
+      # The OpenLobby admin protocol (psu/adminport.py) for a panel on the openlobby network. Never
+      # published: the panel reaches it as http://psu:22191 with this token.
+      PSU_PANEL_PORT: "22191"
+      PSU_PANEL_BIND: 0.0.0.0
+      PSU_PANEL_TOKEN: ${PSU_PANEL_TOKEN:-}
+      PSU_PANEL_CONTAINERS: ${PSU_PANEL_CONTAINERS:-psu-game-1,psu-login-1,psu-patch-1,psu-ssl3-psu-1,psu-ssl3-aoti-1}
+      # What the panel shows under Updates: the build this runs, and setup's last look at the releases.
+      PSU_BUILD_COMMIT: ${PSU_BUILD_COMMIT:-}
+      PSU_BUILT_AT: ${PSU_BUILT_AT:-}
+      PSU_UPDATE_FILE: /state/update.json
+    labels:
+      org.openlobby.role: game
+      org.openlobby.game.key: psu
+      org.openlobby.game.title: Phantasy Star Universe
+      org.openlobby.admin.url: http://psu:22191
+    networks:
+      default:
+      openlobby:
+        aliases: [psu]
+
+  # SSLv3 terminators (OpenSSL 1.1.1 with SSLv3, and stunnel). The entrypoint mints a CA and one
+  # RSA-1024 leaf per login name into the shared certs volume; the PS2 client accepts any RSA
+  # certificate. ssl3-aoti waits for ssl3-psu's leaf, so the two never mint the CA at once.
+  ssl3-psu:
+    <<: *ssl3
+    environment:
+      SSL3_CN: loginps2.psuus.segaonline.jp
+      SSL3_CERT: /certs/ssl3-psu.pem
+    volumes:
+      - ./compose/stunnel-psu.conf:/etc/stunnel/stunnel.conf:ro
+      - ssl3-certs:/certs
+    ports:
+      - "${PSU_PORT_LOGIN_PSU:-12110}:12110"
+      - "${PSU_PORT_GAME:-12061}:12061"
+    depends_on: [login, game]
+    healthcheck:
+      test: ["CMD", "test", "-s", "/certs/ssl3-psu.pem"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  ssl3-aoti:
+    <<: *ssl3
+    environment:
+      SSL3_CN: loginps2.ipsuus.segaonline.jp
+      SSL3_CERT: /certs/ssl3-aoti.pem
+    volumes:
+      - ./compose/stunnel-aoti.conf:/etc/stunnel/stunnel.conf:ro
+      - ssl3-certs:/certs
+    ports:
+      - "${PSU_PORT_LOGIN_AOTI:-12140}:12140"
+    depends_on:
+      login:
+        condition: service_started
+      ssl3-psu:
+        condition: service_healthy
+
+  # The machine's one DNS server for consoles (OpenLobby docs/installs.md, "One DNS for every
+  # install"): OpenLobby's resolver, labelled so the other installs here find it and add their
+  # names. Setup starts it (COMPOSE_PROFILES=dns) only when no install runs one yet, then adds
+  # the four game names under the key psu. It answers those with POL_ADVERTISE and forwards
+  # every other name; it only answers loopback and the private ranges (POL_DNS_CLIENTS).
+  dns:
+    profiles: [dns]
+    image: ghcr.io/prettyopenlobby/openlobby:${OPENLOBBY_TAG:-latest}
+    command: ["dns"]
+    restart: unless-stopped
+    labels:
+      org.openlobby.role: dns
+    environment:
+      POL_ADVERTISE: ${PSU_DNS_ANSWER:-${PSU_GAME_ADDR}}
+      POL_DNS_CLIENTS: ${PSU_DNS_CLIENTS:-}
+    ports:
+      - "${PSU_DNS_BIND:-0.0.0.0}:${PSU_PORT_DNS:-53}:53/udp"
+    volumes:
+      - dns-data:/data
+
+  # Builds the game data from your discs into $PSU_DATA (python -m extract, docs/data.md). Setup
+  # runs it with each disc's folder mounted read-only; by hand:
+  #   docker compose run --rm -v "/path/to/discs:/discs:ro" extract \
+  #       --psu "/discs/Phantasy Star Universe (USA).iso" --out /data
+  # The first run downloads EGS from GitHub, so it needs the internet once.
+  extract:
+    profiles: [extract]
+    build: extract
+    image: psu-extract:local
+    command: ["--help"]
+    volumes:
+      - ${PSU_DATA:-./data}:/data
+      # The unpacked discs and the EGS checkout (under 1 GB), kept for the next run.
+      - extract-cache:/work
+
+  # The byte recorder: listens on the patch and login ports and logs raw traffic. Stop patch,
+  # ssl3-psu and ssl3-aoti first, then: docker compose --profile observe up -d observe
+  observe:
+    <<: *psu
+    profiles: [observe]
+    command: ["psu.observe"]
+    ports:
+      - "11110:11110"
+      - "11140:11140"
+      - "12110:12110"
+      - "12140:12140"
+    volumes:
+      - ${PSU_LOGS:-./logs}:/logs
+    environment:
+      PSU_BIND: 0.0.0.0
+      PSU_OBSERVE_PORTS: "11110,11140,12110,12140"
+      PSU_OBSERVE_GREETING: ${PSU_OBSERVE_GREETING:-}
+      PSU_IDLE_SECS: ${PSU_IDLE_SECS:-600}
+
+  # Experimental, off unless COMPOSE_PROFILES has "experimental": the patch leg of the Xbox 360
+  # disc (11200, patch.psueu.segaonline.jp; its login and game go through Xbox Live, not DNS) and
+  # the Ambition of the Illuminus PC client (patch 11230, login 12230). Neither has been run end to end.
+  patch-extra:
+    <<: *psu
+    profiles: [experimental]
+    command: ["psu.patch"]
+    ports:
+      - "11200:11200"
+      - "11230:11230"
+    volumes:
+      - ${PSU_LOGS:-./logs}:/logs
+    environment:
+      PSU_BIND: 0.0.0.0
+      PSU_PATCH_PORTS: "11200,11230"
+      PSU_IDLE_SECS: ${PSU_IDLE_SECS:-600}
+
+  ssl3-pc:
+    <<: *ssl3
+    profiles: [experimental]
+    environment:
+      SSL3_CN: ${PSU_PC_SSL3_CN:-PSUServer}
+      SSL3_CERT: /certs/ssl3-pc.pem
+    volumes:
+      - ./compose/stunnel-pc.conf:/etc/stunnel/stunnel.conf:ro
+      - ssl3-certs:/certs
+    ports:
+      - "12230:12230"
+    depends_on:
+      login:
+        condition: service_started
+      ssl3-psu:
+        condition: service_healthy
+
+networks:
+  # Made once with `docker network create openlobby` (setup does it); an OpenLobby panel joins it too.
+  openlobby:
+    name: ${OPENLOBBY_NETWORK:-openlobby}
+    external: true
+
+volumes:
+  ssl3-certs:
+  extract-cache:
+  dns-data:

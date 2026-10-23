@@ -1,0 +1,74 @@
+{
+  "_": [
+    "DNAS bypass for the US PSU discs: the single source for every form of it.",
+    "DNAS only, no other behaviour change.",
+    "",
+    "Consumed by extract/bypass.py, which builds all three forms from this file:",
+    "  iso    a prepatched disc image (plus an .xdelta of it for people who want to patch their own)",
+    "  pnach  PCSX2, original disc",
+    "  cheats Cheat Device PS2, original disc on a FreeMcBoot console",
+    "",
+    "The game code is not in the boot ELF but in ERX/PSU_US.GZ: a gzip of a relocatable EE module",
+    "(based at 0, REL relocations). The disc form therefore gunzips it, patches the words AND drops",
+    "the R_MIPS_26 relocation on each patched word (otherwise the loader adds the load base to our",
+    "replacement and turns `move v0, zero` into garbage), then re-deflates it to EXACTLY the original",
+    "size so no LBA on the disc moves. The runtime forms write after relocation and need load_base.",
+    "",
+    "'va' is a module address (pre-relocation, == file .text address). 'expect' is the retail word in",
+    "the file. The four sites are the DNAS object's calls into the DNAS library: the status poll",
+    "becomes a branch to the game's own 'operation complete' path, the three operation starts return",
+    "0 (success) without touching the network."
+  ],
+
+  "games": {
+    "SLUS-21194": {
+      "title": "Phantasy Star Universe (USA)",
+      "short": "PSU",
+      "boot_elf": "SLUS_211.94",
+      "elf_crc": "29B44F89",
+      "source": {"sha1": "92e54e8f0e6ab0f00aa245bab3e67e19a935473e", "size": 4251156480},
+      "module": {
+        "file": "ERX/PSU_US.GZ",
+        "load_base": "0x248000",
+        "load_base_note": "measured from a savestate (extract/p2s.py find): 99 clean windows agree, same on a second boot"
+      },
+      "hook": {"va": "0x1b149c", "op": "00a0902d",
+               "note": "scePad2Read in the boot ELF's libpad2 (export table 0x1bae48, entry 12). $ra is saved at 0x1b1498; this word and the next are plain moves/stores, safe to back up and re-run"},
+      "edits": [
+        {"va": "0x352314", "expect": "0c122d8d", "replace": "10000017",
+         "was": "jal DNAS status poll (stub 0x48b634, import 0x10)", "now": "b 0x352374 (the poll's 'operation complete' path)"},
+        {"va": "0x352590", "expect": "0c122d8b", "replace": "0000102d",
+         "was": "jal DNAS op1 start (stub 0x48b62c, import 0xf)", "now": "move v0, zero (started OK)"},
+        {"va": "0x3524e0", "expect": "0c122d87", "replace": "0000102d",
+         "was": "jal DNAS op2 start (stub 0x48b61c, import 0xd)", "now": "move v0, zero"},
+        {"va": "0x352438", "expect": "0c122d89", "replace": "0000102d",
+         "was": "jal DNAS op3 start (stub 0x48b624, import 0xe)", "now": "move v0, zero"}
+      ]
+    },
+
+    "SLUS-21631": {
+      "title": "Phantasy Star Universe: Ambition of the Illuminus (USA)",
+      "short": "AotI",
+      "boot_elf": "SLUS_216.31",
+      "elf_crc": "5EA50CB0",
+      "source": {"sha1": "b3dd9016bb03f7c4ca6f245d364369142783a04b", "size": 3703570432},
+      "module": {
+        "file": "ERX/PSU_US.GZ",
+        "load_base": "0x23ce00",
+        "load_base_note": "measured over PINE on the retail disc (PCSX2): the four sites hold their R_MIPS_26-relocated jal at this base and 234/235 sampled plain .text words match. A near-identical DNAS function 0x180 earlier also matches a short unrelocated pattern at 0x23cc80; the relocated jal rules that out"
+      },
+      "hook": {"va": "0x1a68a4", "op": "00a0902d",
+               "note": "scePad2Read (export table 0x1b04f8, entry 12); same libpad2 code as PSU, linked lower"},
+      "edits": [
+        {"va": "0x350584", "expect": "0c138bf6", "replace": "1000001e",
+         "was": "jal DNAS status poll (stub 0x4e2fd8, import 0x10)", "now": "b 0x350600 (the poll's 'operation complete' path)"},
+        {"va": "0x350808", "expect": "0c138bf4", "replace": "0000102d",
+         "was": "jal DNAS op1 start (stub 0x4e2fd0, import 0xf)", "now": "move v0, zero (started OK)"},
+        {"va": "0x350758", "expect": "0c138bf0", "replace": "0000102d",
+         "was": "jal DNAS op2 start (stub 0x4e2fc0, import 0xd)", "now": "move v0, zero"},
+        {"va": "0x3506b0", "expect": "0c138bf2", "replace": "0000102d",
+         "was": "jal DNAS op3 start (stub 0x4e2fc8, import 0xe)", "now": "move v0, zero"}
+      ]
+    }
+  }
+}

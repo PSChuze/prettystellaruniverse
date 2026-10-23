@@ -1,0 +1,43 @@
+# On every push: the setup program's tests, the server and tools byte-compiled,
+# the compose file read with the example settings, and a check that no game
+# data is in the repository (hosts build it from their own discs).
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Setup tests
+        run: python -m unittest tests.test_setup tests.test_setup_flow tests.test_setup_discs tests.test_setup_upnp tests.test_setup_panel
+      - name: Byte-compile
+        run: python -m compileall -q server tools extract setup.py hostsetup packaging tests
+      - name: No game data
+        run: |
+          set -eu
+          bad=$(git ls-files | grep -iE '\.(iso|bin|nbl|afs|cvm|erx|elf|gz|xdelta|der|pem|key)$' || true)
+          if [ -n "$bad" ]; then echo "game data or keys in the repository:"; echo "$bad"; exit 1; fi
+      - name: Compose file
+        run: |
+          set -eu
+          cp psu.env.example .env
+          sed -i 's/^PSU_GAME_ADDR=$/PSU_GAME_ADDR=203.0.113.9/' .env
+          docker compose config --quiet
+          docker compose --profile extract --profile experimental --profile observe config --quiet
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Server image
+        run: docker build -t psu-server:ci server

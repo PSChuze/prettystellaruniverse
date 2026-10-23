@@ -1,0 +1,23 @@
+# PSU_US.erx (SLUS-21194) function names, addr<TAB>name. Read by eedis.py.
+302540	ssl_init (sets 4 malloc/free hooks, matrixSslOpen)
+302620	psu_cert_validator (CN == "PSUServer" on any non-last cert; returns 0/1)
+302d80	sslConnect (MatrixSSL example sslSocket.c shape)
+3037e0	TSSLSocketStream_connect_step
+3042b0	psu_load_keys (copies PSUClient, key, PSUCA; matrixSslReadKeysMem)
+46e6c0	matrixSslClose
+46e6d0	matrixSslOpen
+46e700	matrixX509UserValidator
+46e910	matrixX509ValidateCert
+46ea60	validate_against_ca (chain=0)
+46eab0	matrixX509ValidateCertChain
+46f790	matrixX509ParseCert
+46fb70	matrixRsaReadKeysMem
+46fcd0	matrixRsaFreeKeys
+46fda0	matrixSslReadKeysMem
+4704b0	matrixSslSetCertValidator (ssl+0x1e4 = cb, +0x1e8 = arg)
+470550	matrixSslNewSession
+4706e0	thunk_matrixSslFreeKeys
+4706f0	thunk_matrixSslReadKeysMem
+470700	thunk_matrixSslClose
+470710	matrixSslOpen_wrap
+471a50	matrixSslEncodeClientHello

@@ -1,0 +1,241 @@
+{
+  "_doc": [
+    "Published retail values for types 0..9 as on Sega's US servers before the Illuminus update (late 2007): type level cap 10, the level the PSU disc's 10-row table also has. The PSU disc's own rows for 0..9 are the offline-mode values.",
+    "Applied by: python gamedata.py --game psu --type-overrides psu_type_overrides.json [--type-fill linear|disc].",
+    "Facts transcribed from fan wikis (PSUPedia, US Network mode; archive.org snapshots), not Sega data; every source is in the type's sources and in work/retail-types-sources.md.",
+    "levels: type level -> [HP, ATP, ATA, TP, DFP, EVP, MST, STA] % in PSUPedia's column order; null = not published (--type-fill linear interpolates, --type-fill disc keeps the disc value).",
+    "estimated: type level -> columns PSUPedia printed in parentheses (its own estimates). inferred: values that are not printed anywhere but follow from the sources (each type's sources say how).",
+    "race_pct: per-race bonus (PSUPedia 'Favored Types'); omitted races are 100 (the discs' 95 % penalties are offline-only).",
+    "requirements: type -> minimum type level, replaces the disc row. cap: retail type level cap (type_caps in plylevel.json); stat_cap: last level with stat gains (rows above hold it; default cap).",
+    "exp_curve: name in exp_curves = cumulative type EXP (MP) at type level 1, 2, ...; null = not published (interpolated); levels past the cap continue the last step.",
+    "The hidden S5 % (row index 7) is not published anywhere and stays as on the disc."
+  ],
+  "columns": ["HP", "ATP", "ATA", "TP", "DFP", "EVP", "MST", "STA"],
+  "exp_curves": {
+    "basic": [0, 60, 130, 210, 310, 430, 560, 700, 850, 1000],
+    "expert": [0, 400, 900, 1500, 2250, 3750, 4500, 5500, 6500, 8000]
+  },
+  "types": {
+    "Hunter": {
+      "sources": [
+        "http://web.archive.org/web/20071112105530/http://psupedia.info/Types (TL1, TL10: 'Online Comparison')",
+        "http://web.archive.org/web/20110903034318/http://psupedia.info/Hunter (TL2..9 shape; TY07 TL1 and TL10 equal HU11's in every column but TP)"
+      ],
+      "inferred": {
+        "2": ["HP", "ATP", "ATA", "DFP", "EVP", "MST", "STA"],
+        "3": ["HP", "ATP", "ATA", "DFP", "EVP", "MST", "STA"],
+        "4": ["HP", "ATP", "ATA", "DFP", "EVP", "MST", "STA"],
+        "5": ["HP", "ATP", "ATA", "DFP", "EVP", "MST", "STA"],
+        "6": ["HP", "ATP", "ATA", "DFP", "EVP", "MST", "STA"],
+        "7": ["HP", "ATP", "ATA", "DFP", "EVP", "MST", "STA"],
+        "8": ["HP", "ATP", "ATA", "DFP", "EVP", "MST", "STA"],
+        "9": ["HP", "ATP", "ATA", "DFP", "EVP", "MST", "STA"]
+      },
+      "requirements": {},
+      "race_pct": {"Beast": 103},
+      "cap": 10,
+      "exp_curve": "basic",
+      "levels": {
+        "1": [100, 100, 75, 30, 100, 80, 50, 100],
+        "2": [102, 101, 76, 30, 105, 80, 50, 100],
+        "3": [104, 102, 77, 30, 110, 80, 50, 100],
+        "4": [106, 104, 78, 30, 115, 80, 50, 100],
+        "5": [108, 106, 80, 30, 120, 80, 50, 100],
+        "6": [110, 108, 82, 30, 125, 80, 50, 100],
+        "7": [115, 110, 84, 30, 130, 80, 50, 100],
+        "8": [120, 115, 86, 30, 135, 80, 50, 100],
+        "9": [125, 120, 90, 30, 140, 80, 50, 100],
+        "10": [130, 125, 94, 30, 145, 80, 50, 100]
+      }
+    },
+    "Ranger": {
+      "sources": [
+        "http://web.archive.org/web/20071112105530/http://psupedia.info/Types (TL1, TL10: 'Online Comparison'; TL2..9 not published)"
+      ],
+      "requirements": {},
+      "race_pct": {"Cast": 103},
+      "cap": 10,
+      "exp_curve": "basic",
+      "levels": {
+        "1": [80, 75, 100, 35, 75, 120, 60, 110],
+        "2": [null, null, null, null, null, null, null, null],
+        "3": [null, null, null, null, null, null, null, null],
+        "4": [null, null, null, null, null, null, null, null],
+        "5": [null, null, null, null, null, null, null, null],
+        "6": [null, null, null, null, null, null, null, null],
+        "7": [null, null, null, null, null, null, null, null],
+        "8": [null, null, null, null, null, null, null, null],
+        "9": [null, null, null, null, null, null, null, null],
+        "10": [104, 94, 145, 35, 100, 120, 60, 110]
+      }
+    },
+    "Force": {
+      "sources": [
+        "http://web.archive.org/web/20071112105530/http://psupedia.info/Types (TL1, TL10: 'Online Comparison'; TL2..9 not published)"
+      ],
+      "requirements": {},
+      "race_pct": {"Newman": 103},
+      "cap": 10,
+      "exp_curve": "basic",
+      "levels": {
+        "1": [70, 60, 60, 100, 70, 160, 100, 100],
+        "2": [null, null, null, null, null, null, null, null],
+        "3": [null, null, null, null, null, null, null, null],
+        "4": [null, null, null, null, null, null, null, null],
+        "5": [null, null, null, null, null, null, null, null],
+        "6": [null, null, null, null, null, null, null, null],
+        "7": [null, null, null, null, null, null, null, null],
+        "8": [null, null, null, null, null, null, null, null],
+        "9": [null, null, null, null, null, null, null, null],
+        "10": [90, 70, 74, 130, 100, 160, 150, 100]
+      }
+    },
+    "Fighgunner": {
+      "sources": [
+        "http://web.archive.org/web/20071112105530/http://psupedia.info/Types ('Online Fighgunner', TL1..10)"
+      ],
+      "requirements": {"Hunter": 5, "Ranger": 3},
+      "race_pct": {"Human": 103},
+      "cap": 10,
+      "exp_curve": "expert",
+      "levels": {
+        "1": [100, 93, 80, 35, 80, 90, 50, 120],
+        "2": [101, 95, 82, 35, 82, 90, 50, 120],
+        "3": [102, 98, 84, 35, 84, 90, 50, 120],
+        "4": [104, 100, 86, 35, 86, 90, 50, 120],
+        "5": [106, 102, 90, 35, 90, 90, 50, 120],
+        "6": [108, 104, 95, 35, 95, 90, 50, 120],
+        "7": [110, 106, 100, 35, 100, 90, 50, 120],
+        "8": [112, 109, 105, 35, 105, 90, 50, 120],
+        "9": [114, 113, 110, 35, 110, 90, 50, 120],
+        "10": [116, 116, 120, 35, 120, 90, 50, 120]
+      }
+    },
+    "Guntecher": {
+      "sources": [
+        "http://web.archive.org/web/20071112105530/http://psupedia.info/Types ('Online Guntecher', TL1..10)"
+      ],
+      "requirements": {"Ranger": 5, "Force": 3},
+      "race_pct": {"Human": 103, "Newman": 103},
+      "cap": 10,
+      "exp_curve": "expert",
+      "levels": {
+        "1": [80, 75, 100, 35, 60, 120, 75, 120],
+        "2": [82, 76, 105, 36, 61, 120, 76, 120],
+        "3": [84, 77, 110, 37, 62, 120, 77, 120],
+        "4": [86, 78, 115, 38, 63, 120, 78, 120],
+        "5": [88, 80, 120, 39, 64, 120, 80, 120],
+        "6": [90, 82, 125, 40, 65, 120, 82, 120],
+        "7": [92, 84, 130, 41, 66, 120, 84, 120],
+        "8": [96, 86, 135, 42, 68, 120, 86, 120],
+        "9": [100, 90, 140, 43, 70, 120, 90, 120],
+        "10": [104, 94, 160, 44, 80, 120, 100, 120]
+      }
+    },
+    "Wartecher": {
+      "sources": [
+        "http://web.archive.org/web/20071112105530/http://psupedia.info/Types ('Online Wartecher', TL1..10)"
+      ],
+      "requirements": {"Hunter": 3, "Force": 5},
+      "race_pct": {"Human": 103, "Newman": 103},
+      "cap": 10,
+      "exp_curve": "expert",
+      "levels": {
+        "1": [100, 75, 60, 70, 80, 160, 80, 100],
+        "2": [101, 76, 61, 72, 82, 160, 82, 100],
+        "3": [102, 77, 62, 74, 84, 160, 84, 100],
+        "4": [104, 78, 63, 80, 86, 160, 86, 100],
+        "5": [106, 80, 64, 82, 90, 160, 88, 100],
+        "6": [108, 82, 65, 84, 95, 160, 90, 100],
+        "7": [110, 84, 66, 86, 100, 160, 95, 100],
+        "8": [115, 86, 68, 90, 105, 160, 100, 100],
+        "9": [120, 90, 70, 92, 110, 160, 105, 100],
+        "10": [130, 100, 80, 94, 120, 160, 110, 100]
+      }
+    },
+    "Fortefighter": {
+      "sources": [
+        "http://web.archive.org/web/20071112105530/http://psupedia.info/Types ('Online Fortefighter', TL1..10)"
+      ],
+      "requirements": {"Hunter": 10},
+      "race_pct": {"Beast": 103},
+      "cap": 10,
+      "exp_curve": "expert",
+      "levels": {
+        "1": [100, 110, 75, 25, 110, 50, 50, 100],
+        "2": [102, 112, 76, 25, 115, 50, 50, 100],
+        "3": [104, 114, 77, 25, 121, 50, 50, 100],
+        "4": [106, 116, 78, 25, 126, 50, 50, 100],
+        "5": [108, 118, 80, 25, 132, 50, 50, 100],
+        "6": [110, 120, 82, 25, 137, 50, 50, 100],
+        "7": [115, 122, 84, 25, 143, 50, 50, 100],
+        "8": [120, 124, 86, 25, 145, 50, 50, 100],
+        "9": [125, 126, 90, 25, 147, 50, 50, 100],
+        "10": [130, 128, 100, 25, 150, 50, 50, 100]
+      }
+    },
+    "Fortegunner": {
+      "sources": [
+        "http://web.archive.org/web/20071112105530/http://psupedia.info/Types ('Online Fortegunner', TL1..10)"
+      ],
+      "requirements": {"Ranger": 10},
+      "race_pct": {"Cast": 103},
+      "cap": 10,
+      "exp_curve": "expert",
+      "levels": {
+        "1": [80, 86, 150, 30, 60, 140, 50, 125],
+        "2": [82, 90, 155, 30, 61, 140, 50, 125],
+        "3": [84, 94, 160, 30, 62, 140, 50, 125],
+        "4": [86, 96, 165, 30, 63, 140, 50, 125],
+        "5": [90, 98, 170, 30, 64, 140, 50, 125],
+        "6": [95, 100, 175, 30, 65, 140, 50, 125],
+        "7": [100, 102, 180, 30, 66, 140, 50, 125],
+        "8": [105, 104, 185, 30, 68, 140, 50, 125],
+        "9": [110, 106, 190, 30, 70, 140, 50, 125],
+        "10": [115, 108, 200, 30, 80, 140, 50, 125]
+      }
+    },
+    "Fortetecher": {
+      "sources": [
+        "http://web.archive.org/web/20071112105530/http://psupedia.info/Types ('Online Fortetecher', TL1..10)"
+      ],
+      "requirements": {"Force": 10},
+      "race_pct": {"Newman": 103},
+      "cap": 10,
+      "exp_curve": "expert",
+      "levels": {
+        "1": [60, 50, 50, 120, 50, 200, 200, 100],
+        "2": [62, 51, 51, 125, 51, 200, 205, 100],
+        "3": [64, 52, 52, 130, 52, 200, 210, 100],
+        "4": [66, 53, 53, 132, 53, 200, 215, 100],
+        "5": [68, 54, 54, 134, 54, 200, 220, 100],
+        "6": [70, 55, 55, 136, 55, 200, 225, 100],
+        "7": [72, 56, 56, 138, 56, 200, 230, 100],
+        "8": [74, 57, 57, 140, 57, 200, 235, 100],
+        "9": [76, 58, 58, 142, 58, 200, 240, 100],
+        "10": [78, 60, 60, 144, 60, 200, 245, 100]
+      }
+    },
+    "Protranser": {
+      "sources": [
+        "http://web.archive.org/web/20071112105530/http://psupedia.info/Types ('Online Protranser', TL1..10)"
+      ],
+      "requirements": {"Hunter": 5, "Ranger": 5, "Force": 5},
+      "race_pct": {"Human": 103},
+      "cap": 10,
+      "exp_curve": "expert",
+      "levels": {
+        "1": [50, 50, 50, 30, 50, 100, 50, 100],
+        "2": [60, 52, 60, 30, 52, 100, 50, 100],
+        "3": [70, 56, 70, 30, 56, 100, 50, 100],
+        "4": [80, 58, 80, 30, 58, 100, 50, 100],
+        "5": [90, 65, 90, 30, 65, 100, 50, 100],
+        "6": [100, 67, 100, 30, 67, 100, 50, 100],
+        "7": [105, 69, 100, 30, 69, 100, 50, 100],
+        "8": [110, 71, 100, 30, 71, 100, 50, 100],
+        "9": [115, 73, 100, 30, 73, 100, 50, 100],
+        "10": [120, 80, 100, 30, 80, 100, 50, 100]
+      }
+    }
+  }
+}

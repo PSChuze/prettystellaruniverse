@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+data/
+logs/
+*.env
+!psu.env.example
+secrets/
+# Sega key material pulled from the disc stays in work/, never in git
+*.der
+*.pem
+*.key
+# A server folder's own files (setup.py), and the setup program's build
+state/
+backups/
+discs/
+build/
+dist/
+.setup-files
+.setup-version
