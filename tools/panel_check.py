@@ -457,6 +457,8 @@ def main():
     check("the Inbox lists it, waiting, with both messages",
           len(lst["threads"]) == 1 and t["id"] == "1" and t["who"] == "Ethan" and t["waiting"] and not t["closed"]
           and t["count"] == 2 and t["subject"] == "My Photon Arts are gone after a crash")
+    check("each request names its player as the picker does, and its newest message's time",
+          t.get("player") == "Ethan" and isinstance(t.get("last"), int) and t["last"] >= t["at"] - 1)
     st, th = call("/openlobby/help/thread.json?id=1")
     check("the thread holds the player's messages as sent, offline",
           [m["from"] for m in th["messages"]] == ["player", "player"]

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later OR GPL-3.0-or-later
+# Copyright (C) OpenLobby contributors. This file alone may be used under either licence,
+# so a GPL-3.0 game server can carry a copy of it unchanged. See LICENSE for the AGPL.
 """OpenLobby admin port: drop this one file into a game server, and an
 OpenLobby admin panel can show the game and run its actions.
 
@@ -45,7 +48,9 @@ Entries touching [lo, hi) in unix seconds; "times" ([[start, end], ...]) may lis
 sessions inside a long one.
 
 Players' help requests go to the panel's Inbox with port.help_desk(list, thread, reply,
-close): list(open_only) -> [{"id", "subject", "who", "at", "closed", "waiting", "count"}],
+close): list(open_only) -> [{"id", "subject", "who", "at", "closed", "waiting", "count"}]
+(optional "player": the login's id, as @port.players answers it, and "last": the newest
+message's unix seconds),
 thread(id) -> {"id", "subject", "closed", "who": {"name", "online"}, "messages":
 [{"from": "player" or "staff", "subject", "text", "at"}]} (None when there is no such id),
 reply(id, text, close, actor) and close(id, actor) -> (ok, message).

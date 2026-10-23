@@ -6,6 +6,8 @@ import sys
 import threading
 import time
 
+from hostsetup import buildsteps
+
 
 def minutes(seconds):
     m = int(seconds // 60)
@@ -13,9 +15,13 @@ def minutes(seconds):
 
 
 class Progress:
-    """One status line per step: "Building the game data (about 30 minutes): step 3,
-    psu-drops, 7 minutes so far", redrawn in place, and a closing line when the step
-    ends. Without a terminal (output to a file) only the closing lines are written."""
+    """One status line per step: "Building the game data (about 5 minutes): step 3 of 24,
+    PSU enemies, 2 minutes so far", redrawn in place, and a closing line when the step
+    ends. Without a terminal (output to a file or another program) each step gets a line
+    when it starts and ends, and the status line every `every` seconds in between, so a
+    long step never goes quiet."""
+
+    every = 30
 
     def __init__(self, out=None, clock=time.monotonic):
         self.out = out or sys.stdout
@@ -25,12 +31,14 @@ class Progress:
         self.detail = ""
         self.started = 0.0
         self.width = 0
+        self.said = 0.0
 
     def begin(self, title, estimate=""):
         if self.title == title:
             return
         self.end()
         self.title, self.estimate, self.detail, self.started = title, estimate, "", self.clock()
+        self.said = self.started
         if not self.live:
             self._write("%s%s...\n" % (title, " (%s)" % estimate if estimate else ""))
         self.tick()
@@ -47,10 +55,15 @@ class Progress:
         return text + ": " + ", ".join(parts)
 
     def tick(self):
-        if self.live and self.title:
+        if not self.title:
+            return
+        if self.live:
             text = self.line()
             self._write("\r" + text + " " * max(0, self.width - len(text)))
             self.width = len(text)
+        elif self.clock() - self.said >= self.every:
+            self.said = self.clock()
+            self._write(self.line() + "\n")
 
     def end(self, ok=True):
         if not self.title:
@@ -92,6 +105,8 @@ def run_logged(cmd, log, on_line=None, progress=None, cwd=None, env=None):
             continue
         if line is None:
             break
+        if progress:
+            progress.tick()
         log.write(line)
         log.flush()
         line = line.rstrip("\r\n")
@@ -105,26 +120,62 @@ def run_logged(cmd, log, on_line=None, progress=None, cwd=None, env=None):
 class ExtractWatcher:
     """Turns the game data builder's output (python -m extract, extract/build.py) into steps for a
     Progress: it prints "<step> ..." as each step starts and "<step>: up to date" for one a
-    previous run did; "<game>-disc" steps unpack the discs, and EGS is fetched once."""
+    previous run did; "<game>-disc" steps unpack the discs, and EGS is fetched once. games: the
+    discs being built, to count the steps and name them."""
 
     STEP = re.compile(r"^([a-z][a-z0-9_-]*)(?: \.\.\.|: up to date)$")
+    BUILDING = ("Building the game data", "about 5 minutes")
 
-    def __init__(self, progress):
-        self.progress, self.steps = progress, 0
+    def __init__(self, progress, games=()):
+        self.progress = progress
+        self.names = buildsteps.step_order(games) if games else []
+        self.steps = 0
+        self.name = ""
+        self.stage = ""
 
     def __call__(self, line):
         if line.strip().startswith("fetching EGS"):
+            self.stage = "download"
             self.progress.begin("Downloading the lobby builder (EGS)", "about a minute")
             return
         m = self.STEP.match(line)
         if not m:
             return
-        self.steps += 1
-        if m.group(1).endswith("-disc"):
-            self.progress.begin("Reading your discs", "a few minutes")
+        self.name = m.group(1)
+        self.steps = self.names.index(self.name) + 1 if self.name in self.names else self.steps + 1
+        self.stage = "discs" if self.name.endswith("-disc") else "steps"
+        self.show(self.progress)
+
+    def show(self, progress):
+        """Carry on drawing on `progress`, starting from where the lines so far got to."""
+        self.progress = progress
+        if self.stage == "discs":
+            progress.begin("Reading your discs", "under a minute")
+            progress.set(self.where())
+        elif self.stage == "steps":
+            progress.begin(*self.BUILDING)
+            progress.set(self.where())
+        elif self.stage == "download":
+            progress.begin("Downloading the lobby builder (EGS)", "about a minute")
         else:
-            self.progress.begin("Building the game data", "about 30 minutes")
-        self.progress.set("step %d, %s" % (self.steps, m.group(1)))
+            progress.begin("Getting ready to read your discs", "a minute")
+
+    def where(self):
+        """"step 13 of 24, AotI missions and counters (about 2 minutes)": the step running now."""
+        text = "step %d of %d" % (self.steps, len(self.names)) if self.names else "step %d" % self.steps
+        if self.name:
+            text += ", " + buildsteps.plain_name(self.name)
+            if buildsteps.rough_time(self.name):
+                text += " (%s)" % buildsteps.rough_time(self.name)
+        return text
+
+    def summary(self):
+        """Where the build is, for "The game data is still being built: ..."."""
+        if self.stage in ("discs", "steps"):
+            return self.where()
+        if self.stage == "download":
+            return "downloading the lobby builder (EGS)"
+        return "getting started"
 
 
 # What a failed build's last lines usually mean, in words a host can act on.
@@ -134,9 +185,12 @@ KNOWN_ERRORS = [
     (r"(?i)sha1 mismatch|not the retail|not a Redump", "The disc image is not a plain copy of the retail disc. "
                                                         "Make a new image of the disc and try again."),
     (r"No space left on device|no space left", "The disk is full. Free some space (the build needs about "
-                                                "10 GB) and try again."),
+                                                "6 GB) and try again."),
     (r"(?i)urlopen error|name resolution|timed out|connection (reset|refused)|Could not resolve host",
      "A download failed. Check the internet connection and try again."),
+    (r"(?m)most likely out of memory|MemoryError|^Killed$",
+     "Docker ran out of memory. Close other programs or give Docker more memory, then choose "
+     "Rebuild the game data: it carries on where it stopped."),
     (r"(?i)port is already allocated|address already in use",
      "Another program on this computer uses one of the server's ports. Close it (or stop the other "
      "server) and try again."),
@@ -150,3 +204,39 @@ def explain(tail):
         if re.search(pattern, text):
             return message
     return ""
+
+
+class Slow:
+    """with Slow("Docker is slow to answer..."): prints the note when the block takes
+    longer than `after` seconds, then a line every `every` seconds, so a wait never looks
+    like nothing is happening."""
+
+    def __init__(self, note, after=3.0, every=20.0, out=None):
+        self.note, self.after, self.every = note, after, every
+        self.out = out
+        self.done = threading.Event()
+        self.thread = None
+
+    def __enter__(self):
+        self.out = self.out or sys.stdout
+        self.thread = threading.Thread(target=self._watch, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self.done.set()
+        self.thread.join()
+        return False
+
+    def _watch(self):
+        if self.done.wait(self.after):
+            return
+        self._write("  %s\n" % self.note)
+        waited = self.after
+        while not self.done.wait(self.every):
+            waited += self.every
+            self._write("  Still waiting (%s so far)...\n" % minutes(waited))
+
+    def _write(self, text):
+        self.out.write(text)
+        self.out.flush()

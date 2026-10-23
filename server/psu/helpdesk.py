@@ -104,11 +104,13 @@ def deliver_later(p, delay=None):
 # --- the panel's Inbox (olport help_desk) ------------------------------------------------------------
 
 def threads(open_only=False):
-    q = ("SELECT t.id, t.subject, t.name, t.updated, t.closed, t.waiting, count(m.id) FROM help_threads t "
+    q = ("SELECT t.id, t.subject, t.name, t.updated, t.closed, t.waiting, count(m.id), max(m.at) FROM help_threads t "
          "LEFT JOIN help_messages m ON m.thread = t.id %s GROUP BY t.id ORDER BY t.updated DESC LIMIT ?"
          % ("WHERE t.closed = 0" if open_only else ""))
-    return [{"id": str(i), "subject": s, "who": n, "at": int(u), "closed": bool(c), "waiting": bool(w) and not c,
-             "count": k} for i, s, n, u, c, w, k in _c().execute(q, (LIST_MAX,)).fetchall()]
+    # "player" is the character name, the id the panel's player picker uses (adminport.character_picks)
+    return [{"id": str(i), "subject": s, "who": n, "player": n, "at": int(u), "last": int(la or u),
+             "closed": bool(c), "waiting": bool(w) and not c, "count": k}
+            for i, s, n, u, c, w, k, la in _c().execute(q, (LIST_MAX,)).fetchall()]
 
 
 def _tid(tid):

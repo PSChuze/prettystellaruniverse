@@ -4,11 +4,13 @@ The first run asks three questions (who plays, where the discs are, the server's
 .env, builds the game data from the discs, starts the server in Docker and checks it. Later runs
 show a menu: start and stop, settings, update, backups, pairing with an OpenLobby admin panel,
 patched disc images for players. Needs Docker and nothing else (Python 3.8+ when run as a script,
-standard library only).
+standard library only). `setup.py --update --yes` updates without asking anything (an OpenLobby
+panel's updater runs it); `--check-update` only looks for a newer release.
 """
 import argparse
 import datetime
 import hashlib
+import io
 import json
 import os
 import re
@@ -19,12 +21,15 @@ import subprocess
 import sys
 import tempfile
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
 
 from hostsetup import discs as disclib
+from hostsetup import diskspace
+from hostsetup import dockermem
 from hostsetup import progress as proglib
 from hostsetup import upnp
 
@@ -53,16 +58,25 @@ PORTS = (("PSU_PORT_PATCH_PSU", 11110, "TCP", "PSU patch"),
          ("PSU_PORT_DNS", 53, "UDP", "DNS"))
 SERVICES = ("patch", "login", "game", "ssl3-psu", "ssl3-aoti")
 # Files of ours in the server folder that an update must never replace.
-KEEP = (".env", "compose.override.yml", "state", "data", "backups", "logs", "discs")
+KEEP = (".env", "compose.override.yml", "state", "data", "backups", "logs", "discs", "What to tell players.txt")
 PANEL_ROLE = "org.openlobby.role=panel"
 PANEL_URL_LABEL = "org.openlobby.panel.url"
 PANEL_ADMIN_URL = "http://psu:22191"
 GAME_TITLE = "Phantasy Star Universe"
+# extract/build.py writes it in the data folder after the last step (build.BUILT).
+BUILT_MARK = ".built"
+# Files of extract/ that are not in the extract image, so not in its fingerprint (build.UNHASHED).
+UNHASHED = ("Dockerfile", ".dockerignore")
+# How an OpenLobby panel's updater runs an update here (OpenLobby docs/installs.md, "Updates").
+UPDATER_COMMAND = ["python3", "setup.py", "--update", "--yes"]
+UPDATER_TIMEOUT = 180
+# Set by --yes: nothing may be asked; each question takes its safe answer or the run stops.
+UNATTENDED = False
 
 
 def use_root(path):
     """Point every path at the server folder `path`."""
-    global ROOT, ENV, ENV_EXAMPLE, BACKUPS, CHOICES, LOG, MANIFEST, VERSION_FILE, UPDATE_FILE
+    global ROOT, ENV, ENV_EXAMPLE, BACKUPS, CHOICES, LOG, MANIFEST, VERSION_FILE, UPDATE_FILE, NOTE, LOCK
     ROOT = os.path.abspath(path)
     ENV = os.path.join(ROOT, ".env")
     ENV_EXAMPLE = os.path.join(ROOT, "psu.env.example")
@@ -72,6 +86,8 @@ def use_root(path):
     MANIFEST = os.path.join(ROOT, ".setup-files")
     VERSION_FILE = os.path.join(ROOT, ".setup-version")
     UPDATE_FILE = os.path.join(ROOT, "state", "update.json")
+    NOTE = os.path.join(ROOT, "What to tell players.txt")
+    LOCK = os.path.join(ROOT, "state", "update.lock")
 
 
 use_root(os.path.dirname(os.path.abspath(__file__)))
@@ -85,6 +101,9 @@ def say(text=""):
 
 def ask(question, default=""):
     shown = " [%s]" % default if default else ""
+    if UNATTENDED:
+        raise SystemExit("Setup needed an answer to \"%s\" and was told not to ask. Run PSU Server Setup "
+                         "on the server's computer." % question)
     try:
         answer = input("%s%s: " % (question, shown)).strip()
     except EOFError:
@@ -243,9 +262,71 @@ def source_archive():
     return path, {"tag": "dev"}
 
 
+def version_key(tag):
+    """A release tag such as v1.2.3 as numbers to compare, or None for any other name."""
+    m = re.match(r"^v?(\d+(?:\.\d+)*)$", tag or "")
+    return tuple(int(n) for n in m.group(1).split(".")) if m else None
+
+
+def compare_versions(new, old):
+    """"newer", "older" or "same": version `new` ({"tag", "commit"}) against `old`. Release tags
+    compare as versions; other names only tell whether the files differ, and different counts as
+    newer."""
+    new, old = new or {}, old or {}
+    if not new.get("tag") and not new.get("commit"):
+        return "same"
+    a, b = version_key(new.get("tag")), version_key(old.get("tag"))
+    if a and b and a != b:
+        return "newer" if a > b else "older"
+    if new.get("commit") and old.get("commit"):
+        return "same" if new["commit"] == old["commit"] else "newer"
+    return "same" if new.get("tag") == old.get("tag") else "newer"
+
+
+def shown_version(version):
+    tag = (version or {}).get("tag") or ""
+    if not tag:
+        return "an earlier version"
+    return tag[1:] if tag.startswith("v") and version_key(tag) else tag
+
+
+def apply_carried(archive, carried):
+    """Replace the server's files with the ones this program carries when they are newer, the
+    way Update does; never with older ones. A git checkout is left alone. The host's .env,
+    state, data and backups stay (KEEP). True when the files changed."""
+    installed = installed_version()
+    if os.path.exists(os.path.join(ROOT, ".git")):
+        return False
+    order = compare_versions(carried, installed)
+    if order == "older":
+        say("This PSU Server Setup is older than your server (%s < %s). Download the newest one from %s"
+            % (shown_version(carried), shown_version(installed), RELEASES))
+        return False
+    if order == "same":
+        return False
+    try:
+        unpack_server(archive, ROOT, carried)
+    except (OSError, zipfile.BadZipFile) as e:
+        say("Could not update your server's files (%s). Setup carries on with the ones you have." % e)
+        return False
+    say("This is a newer PSU Server Setup (%s). It updated your server's files from %s."
+        % (shown_version(carried), shown_version(installed)))
+    if os.path.exists(ENV):
+        # The server program still has to be built from the new files; kept until that is
+        # done, so closing the window does not lose it.
+        choices = read_choices()
+        choices["files_updated"] = True
+        write_choices(choices)
+    return True
+
+
 def ensure_server_files():
-    """Put the server's files in ROOT when they are not there yet."""
+    """Put the server's files in ROOT when they are not there yet, or update them when this
+    program carries newer ones."""
     if os.path.exists(os.path.join(ROOT, "compose.yml")):
+        archive = bundled("server.zip")
+        if archive:
+            apply_carried(archive, source_archive()[1])
         return True
     archive, version = source_archive()
     if not archive:
@@ -258,18 +339,20 @@ def ensure_server_files():
     return True
 
 
-def tree_digest(*folders):
-    """One hash over every file under these folders of ROOT, to tell whether an update changed
-    the game data builder."""
+def extract_version(top=None):
+    """The fingerprint of the game data builder in the server folder: the same hash
+    extract/build.py writes into data/.built (build.fingerprint)."""
+    top = top or os.path.join(ROOT, "extract")
     h = hashlib.sha256()
-    for folder in folders:
-        for base, dirs, files in os.walk(os.path.join(ROOT, folder)):
-            dirs[:] = sorted(d for d in dirs if d != "__pycache__")
-            for name in sorted(files):
-                path = os.path.join(base, name)
-                h.update(os.path.relpath(path, ROOT).replace("\\", "/").encode())
-                with open(path, "rb") as f:
-                    h.update(hashlib.sha256(f.read()).digest())
+    for base, dirs, files in os.walk(top):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for name in sorted(files):
+            if name.endswith(".pyc") or (base == top and name in UNHASHED):
+                continue
+            path = os.path.join(base, name)
+            h.update(os.path.relpath(path, top).replace(os.sep, "/").encode() + b"\0")
+            with open(path, "rb") as f:
+                h.update(hashlib.sha256(f.read()).digest())
     return h.hexdigest()
 
 
@@ -279,6 +362,8 @@ def run(cmd, check=True, capture=False, **kw):
     """Run a command in the server folder; its output goes to the terminal unless captured."""
     if capture:
         kw.update(stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+        # Docker must not read the answers meant for setup's questions.
+        kw.setdefault("stdin", subprocess.DEVNULL)
     result = subprocess.run(cmd, cwd=ROOT if os.path.isdir(ROOT) else None, **kw)
     if check and result.returncode != 0:
         raise SystemExit("Failed (exit %d): %s" % (result.returncode, " ".join(cmd)))
@@ -380,6 +465,53 @@ def wait_for_docker(wait=True):
 def docker_desktop():
     out = run(["docker", "info", "--format", "{{.OperatingSystem}}"], check=False, capture=True).stdout
     return "docker desktop" in (out or "").lower()
+
+
+def docker_output(cmd):
+    """(exit code, output) of a docker command; (1, "") when docker cannot be run at all."""
+    try:
+        got = run(cmd, check=False, capture=True)
+    except OSError:
+        return 1, ""
+    return got.returncode, got.stdout or ""
+
+
+def volume_exists(name):
+    code, out = docker_output(["docker", "volume", "ls", "-q", "--filter", "name=" + name])
+    return code == 0 and name in out.split()
+
+
+def cache_volume():
+    """The extract cache volume (compose.yml's extract-cache): the unpacked discs and EGS."""
+    return PROJECT + "_extract-cache"
+
+
+def build_container():
+    """(id, docker's state, exit code or None) of the newest game data build container,
+    preferring one that runs; None when there is none."""
+    code, out = docker_output(["docker", "ps", "-a", "--filter", "label=com.docker.compose.project=%s" % PROJECT,
+                               "--filter", "label=com.docker.compose.service=extract",
+                               "--format", "{{.ID}}\t{{.State}}\t{{.Status}}"])
+    rows = [line.split("\t") for line in out.splitlines() if line.count("\t") == 2] if code == 0 else []
+    if not rows:
+        return None
+    cid, state, status = ([r for r in rows if r[1] == "running"] or rows)[0]    # docker lists the newest first
+    m = re.search(r"Exited \((-?\d+)\)", status)
+    return cid, state, int(m.group(1)) if m else None
+
+
+def docker_resources():
+    """(Docker's memory in bytes, True on Docker Desktop's WSL 2 engine); None for what docker
+    does not say."""
+    code, out = docker_output(["docker", "info", "--format", "{{.MemTotal}}|{{.KernelVersion}}"])
+    parts = out.strip().split("|") if code == 0 else []
+    if len(parts) != 2:
+        return None, False
+    return dockermem.parse_bytes(parts[0]), "microsoft" in parts[1].lower() or "wsl" in parts[1].lower()
+
+
+def host_system():
+    return "windows" if os.name == "nt" else "mac" if sys.platform == "darwin" else "linux"
 
 
 def network_name():
@@ -689,15 +821,54 @@ def data_dir(env):
     return folder_of(env, "PSU_DATA", "data")
 
 
-def has_data(env):
-    """True when the game data is built: lobby archives and the game's tables."""
-    d = data_dir(env)
+def built_info(env):
+    """What data/.built says about the finished build ({"fingerprint", "discs", ...}), or None
+    when the build never got to the end."""
     try:
-        nbl = any(n.lower().endswith(".nbl") for n in os.listdir(os.path.join(d, "nbl")))
-        tables = any(n.endswith(".json") for n in os.listdir(os.path.join(d, "gamedata")))
-    except OSError:
-        return False
-    return nbl and tables
+        with open(os.path.join(data_dir(env), BUILT_MARK), encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def any_data(env):
+    d = data_dir(env)
+    for sub in ("nbl", "gamedata", "captures"):
+        try:
+            if os.listdir(os.path.join(d, sub)):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def game_data(env, choices, build=None):
+    """"built", "building" (a build container runs), "partial" (a build stopped part way) or
+    "none"."""
+    if build and build[1] in ("running", "restarting", "created"):
+        return "building"
+    if built_info(env) is not None:
+        return "built"
+    if not any_data(env):
+        return "none"
+    # Built by a setup from before builds were marked finished (it never wrote "build"):
+    # the seasons are the last step's output, so they are there only when it got to the end.
+    if "build" not in choices and os.path.isdir(os.path.join(data_dir(env), "nbl", "season-staging")):
+        return "built"
+    return "partial"
+
+
+def has_data(env):
+    """True when the game data is built to the end."""
+    return game_data(env, read_choices()) == "built"
+
+
+def data_current(env):
+    """True when the built game data came from the game data builder in this folder (an update
+    that changed extract/ needs it built again; its finished steps are kept)."""
+    info = built_info(env)
+    return bool(info) and info.get("fingerprint") == extract_version()
 
 
 def make_folders(env):
@@ -819,16 +990,37 @@ def disc_records(chosen):
 
 # --- discs to game data ------------------------------------------------------------------
 
+def windows_path(path):
+    return bool(re.match(r"^[A-Za-z]:[\\/]", path or ""))
+
+
+def host_folder(path):
+    """A disc's folder as Docker on this machine mounts it. Setup normally runs where the discs
+    are; an OpenLobby panel's updater runs it in a Linux container next to Docker Desktop, where
+    a Windows folder is reached through Docker Desktop's own mount of the drives."""
+    if windows_path(path) and os.name != "nt":
+        folder = path.replace("\\", "/").rsplit("/", 1)[0]
+        return "/run/desktop/mnt/host/%s%s" % (folder[0].lower(), folder[2:])
+    return os.path.dirname(os.path.abspath(path)).replace("\\", "/")
+
+
+def disc_there(path):
+    """True when the disc image is there (or, from an updater's container, may be: setup
+    cannot look at the Windows drive from there)."""
+    return os.path.exists(path) or (windows_path(path) and os.name != "nt")
+
+
 def disc_mounts(records):
     """(docker -v options, extract's arguments for the discs): each disc's folder is shared
     read-only."""
     folders, volumes, args = [], [], []
     for item in records:
-        folder = os.path.dirname(os.path.abspath(item["path"]))
+        folder = host_folder(item["path"])
         if folder not in folders:
             folders.append(folder)
-            volumes += ["-v", "%s:/discs/%d:ro" % (folder.replace("\\", "/"), len(folders))]
-        args += ["--" + item["game"], "/discs/%d/%s" % (folders.index(folder) + 1, os.path.basename(item["path"]))]
+            volumes += ["-v", "%s:/discs/%d:ro" % (folder, len(folders))]
+        name = re.split(r"[\\/]", item["path"])[-1]
+        args += ["--" + item["game"], "/discs/%d/%s" % (folders.index(folder) + 1, name)]
     return volumes, args
 
 
@@ -865,33 +1057,351 @@ def build_image(progress, log):
     return True
 
 
-def build_game_data(env, choices, progress, log):
-    """Run the game data build with a plain progress display. True when it worked."""
-    records = [r for r in choices.get("discs", []) if os.path.exists(r["path"])]
+def build_game_data(env, choices, progress, log, fresh=False, retry=True):
+    """Run the game data build with a plain progress display. True when it worked.
+
+    The build runs detached (`compose run -d`), followed with `docker logs -f`: closing this
+    window leaves it running, and the next run of setup follows it again. It carries on from
+    the steps an earlier build finished (their stamps in the cache volume) unless fresh. When
+    Docker stops part way, setup waits for it and carries on (retry)."""
+    records = [r for r in choices.get("discs", []) if disc_there(r["path"])]
     if not records:
         say("The disc images setup used before are gone. Choose Rebuild the game data and pick them again.")
         return False
+    if retry:
+        check_docker_memory()
     make_folders(env)
     progress.begin("Getting the game data builder ready", "a few minutes the first time")
     code, tail = proglib.run_logged(compose_cmd("--profile", "extract", "build", "extract"), log, cwd=ROOT,
                                     progress=progress)
     progress.end(code == 0)
     if code != 0:
+        if dockermem.engine_stopped(tail, code) and retry:
+            return after_crash(env, choices, progress, log)
         failed("Getting the game data builder ready failed.", tail)
         return False
+    old = build_container()
+    if old and old[1] != "running":
+        docker_output(["docker", "rm", old[0]])
+    try:
+        os.remove(os.path.join(data_dir(env), BUILT_MARK))
+    except OSError:
+        pass
+    choices["build"] = "started"
+    write_choices(choices)
     volumes, args = disc_mounts(records)
-    cmd = compose_cmd("--profile", "extract", "run", "--rm") + volumes + ["extract"] + args + ["--out", "/data"]
-    say("Building the game data takes 30 to 40 minutes the first time (it downloads EGS once).")
-    progress.begin("Reading your discs", "a few minutes")
-    code, tail = proglib.run_logged(cmd, log, on_line=proglib.ExtractWatcher(progress), cwd=ROOT,
-                                    progress=progress)
-    progress.end(code == 0)
-    if code != 0:
+    cmd = (compose_cmd("--profile", "extract", "run", "-d") + volumes + ["extract"] + args + ["--out", "/data"]
+           + (["--rebuild"] if fresh else []))
+    got = run(cmd, check=False, capture=True)
+    log.write(got.stdout or "")
+    build = build_container()
+    if got.returncode != 0 or not build:
+        tail = (got.stdout or "").splitlines()[-30:]
+        if dockermem.engine_stopped(tail, got.returncode):
+            choices["build"] = "crashed"
+            write_choices(choices)
+            return after_crash(env, choices, progress, log) if retry else False
         failed("Building the game data failed.", tail)
-    elif not has_data(env):
-        failed("The game data builder finished but left no game data in %s." % data_dir(env), tail)
+        choices["build"] = "failed"
+        write_choices(choices)
         return False
-    return code == 0
+    say("Building the game data takes about 5 minutes (the first time it also downloads EGS). If this")
+    say("window closes, the build keeps going: run PSU Server Setup again to see how far it got.")
+    return follow_build(build[0], choices, progress, log, retry=retry)
+
+
+def build_games(choices):
+    return [r["game"] for r in choices.get("discs", [])]
+
+
+def build_history(cid, choices):
+    """(an ExtractWatcher fed the build's output so far, the time of its last line)."""
+    watcher = proglib.ExtractWatcher(proglib.Progress(out=io.StringIO()), build_games(choices))
+    _code, out = docker_output(["docker", "logs", "-t", cid])
+    since = ""
+    watcher.tail = []
+    for line in out.splitlines():
+        stamp, text = split_stamp(line)
+        since = stamp or since
+        watcher(text)
+        watcher.tail = (watcher.tail + [text])[-30:]
+    return watcher, since
+
+
+def split_stamp(line):
+    """("2026-01-02T03:04:05.000000000Z", "the line") from `docker logs -t` output."""
+    m = re.match(r"(\d{4}-\d\d-\d\dT\S+Z) (.*)$", line)
+    return (m.group(1), m.group(2)) if m else ("", line)
+
+
+def follow_build(cid, choices, progress, log, history=None, retry=True):
+    """Show the build's progress until it ends, then tidy up. True when it built everything.
+    When Docker stopped under it, carries on as build_game_data does (retry)."""
+    watcher, since = history or build_history(cid, choices)
+    watcher.show(progress)
+    tail = list(getattr(watcher, "tail", []))
+
+    def on_line(line):
+        stamp, text = split_stamp(line)
+        if stamp and since and stamp <= since:
+            return
+        tail.append(text)
+        del tail[:-30]
+        watcher(text)
+
+    cmd = ["docker", "logs", "-f", "-t"] + (["--since", since] if since else []) + [cid]
+    code, _ = proglib.run_logged(cmd, log, on_line=on_line, cwd=ROOT, progress=progress)
+    build = build_container()
+    for _ in range(10):
+        # `docker logs -f` ends as the container stops; docker can take a moment to say so.
+        if not (build and build[0] == cid and build[1] == "running"):
+            break
+        time.sleep(1)
+        build = build_container()
+    if build and build[0] == cid and build[1] == "running":
+        progress.end(False)
+        say("Setup lost sight of the build, but it is still running. Run PSU Server Setup again")
+        say("in a while to see how far it got.")
+        return False
+    ours = bool(build) and build[0] == cid
+    env = read_env()
+    ok = (build[2] == 0 if ours else True) and built_info(env) is not None
+    progress.end(ok)
+    crashed = not ok and build_crashed(cid, tail, build[2] if ours else None, code != 0 and not build)
+    if ours:
+        docker_output(["docker", "rm", cid])
+    if crashed:
+        choices["build"] = "crashed"
+        write_choices(choices)
+        return after_crash(env, choices, progress, log) if retry else False
+    choices["build"] = "done" if ok else "failed"
+    write_choices(choices)
+    if not ok:
+        failed("Building the game data failed." if not ours or build[2] else
+               "The game data builder finished but did not mark the game data in %s as built." % data_dir(env), tail)
+    return ok
+
+
+def build_crashed(cid, tail, exit_code, docker_gone=False):
+    """True when the build stopped because Docker did (or ran out of memory), not because of
+    the build itself."""
+    if dockermem.engine_stopped(tail, exit_code):
+        return True
+    code, out = docker_output(["docker", "inspect", "-f", "{{.State.OOMKilled}}", cid])
+    if code == 0:
+        return out.strip() == "true"
+    return docker_gone or docker_state() != "ok"
+
+
+DOCKER_STOPPED = "Docker stopped while building the game data. This usually means it ran out of memory."
+
+
+def after_crash(env, choices, progress, log):
+    """Docker stopped part way through a build: wait for it to come back and carry on where
+    the build stopped, once by itself, then asking (unattended: once, then stop)."""
+    first = True
+    while True:
+        say()
+        say(DOCKER_STOPPED)
+        if UNATTENDED:
+            # Nobody to press Enter: give Docker (Desktop restarting its VM) ten minutes.
+            for i in range(20):
+                if docker_state() == "ok":
+                    break
+                say("Waiting for Docker to run again (%d of 10 minutes)..." % (i // 2))
+                time.sleep(30)
+            if docker_state() != "ok":
+                return False
+        elif not wait_for_docker():
+            return False
+        check_docker_memory(again=True)
+        say()
+        if first:
+            say("Carrying on where it stopped.")
+        elif UNATTENDED or not ask_yes("Carry on where it stopped?"):
+            say("You can carry on later: run PSU Server Setup again.")
+            return False
+        first = False
+        if build_game_data(env, choices, progress, log, retry=False):
+            return True
+        if choices.get("build") != "crashed":
+            return False
+
+
+_memory_told = False
+_wsl_written = False
+RESTART_DOCKER = ("Docker Desktop uses it once it restarts: quit Docker Desktop (right-click the",
+                  "whale by the clock, then Quit Docker Desktop), open Command Prompt and type",
+                  "  wsl --shutdown",
+                  "then start Docker Desktop again. If a build is running then, setup carries on",
+                  "where it stopped.")
+
+
+def check_docker_memory(again=False):
+    """Before a build: when Docker has little memory, say so and how to give it more. The
+    build goes on either way."""
+    global _memory_told
+    if _memory_told and not again:
+        return
+    mem, wsl = docker_resources()
+    if not mem or mem >= dockermem.LOW:
+        return
+    _memory_told = True
+    say()
+    say("Docker has %s of memory. The game data build itself needs little, but Docker can stop part"
+        % dockermem.gb(mem))
+    say("way when everything it runs together needs more.")
+    system = host_system()
+    if system == "windows" and wsl and not UNATTENDED:
+        offer_wslconfig(mem)
+    elif system in ("windows", "mac"):
+        say("To give it more: in Docker Desktop, open Settings, then Resources, and set Memory to")
+        say("%s or more. Then click Apply & restart." % dockermem.gb(dockermem.WANT))
+    else:
+        say("This computer has little free memory. Closing other programs while it builds helps.")
+
+
+def offer_wslconfig(mem):
+    """Docker Desktop on WSL 2 takes its memory from .wslconfig: offer to set it there."""
+    global _wsl_written
+    if _wsl_written:
+        say("Setup has set more memory in .wslconfig. " + RESTART_DOCKER[0])
+        for line in RESTART_DOCKER[1:]:
+            say(line)
+        return
+    computer = dockermem.computer_memory()
+    value = dockermem.memory_to_offer(computer, mem)
+    if not value:
+        say("This computer has %s of memory, so Docker cannot be given much more." % dockermem.gb(computer or mem))
+        return
+    path = dockermem.wslconfig_path()
+    now = dockermem.wsl_memory_now(dockermem.read_text(path))
+    line = "memory=%s" % dockermem.wsl_memory_value(value)
+    say("Docker Desktop's memory is set in a file named .wslconfig in your user folder.")
+    say("Setup can give it %s by writing these lines to %s" % (dockermem.gb(value), path))
+    say("(anything else in that file stays as it is%s):" % (", only memory=%s changes" % now if now else ""))
+    say("  [wsl2]")
+    say("  " + line)
+    if not ask_yes("Write them?"):
+        return
+    try:
+        dockermem.write_wslconfig(dockermem.wsl_memory_value(value))
+    except OSError as e:
+        say("Setup could not write %s: %s" % (path, e))
+        return
+    _wsl_written = True
+    say("Done. " + RESTART_DOCKER[0])
+    for line in RESTART_DOCKER[1:]:
+        say(line)
+
+
+# --- free disk space ---------------------------------------------------------------------
+
+PROBE_IMAGES = ("psu-server:local", "psu-extract:local", "alpine", "busybox", "python:3.12-slim")
+MOVE_DOCKER_DISK = ("  1. Open Docker Desktop and click Settings (the gear at the top).",
+                    "  2. Click Resources, then Advanced.",
+                    "  3. Under Disk image location, click Browse and pick a folder on a drive with more",
+                    "     free space.",
+                    "  4. Click Apply & restart.")
+DOCKER_DATA_ROOT = "https://docs.docker.com/engine/daemon/#daemon-data-directory"
+
+
+def docker_vm_free():
+    """Free bytes inside Docker's storage, read by df in a throwaway container of an image that
+    is there already; None when there is none or docker does not answer."""
+    for image in PROBE_IMAGES:
+        if docker_output(["docker", "image", "inspect", "-f", "{{.Id}}", image])[0] == 0:
+            break
+    else:
+        return None
+    code, out = docker_output(["docker", "run", "--rm", "--pull", "never", "--network", "none",
+                               "--entrypoint", "df", image, "-kP", "/"])
+    return diskspace.parse_df(out) if code == 0 else None
+
+
+def docker_space():
+    """(free bytes or None, the folder holding Docker's storage, True on Docker Desktop)."""
+    code, out = docker_output(["docker", "info", "--format", "{{.DockerRootDir}}|{{.OperatingSystem}}"])
+    parts = out.strip().split("|") if code == 0 else []
+    if len(parts) != 2:
+        return None, "", False
+    root, system_name = parts
+    if "docker desktop" not in system_name.lower():
+        return (diskspace.free_at(root) if os.path.isabs(root) else None), root, False
+    system = host_system()
+    folder = diskspace.desktop_disk_dir(diskspace.read_texts(diskspace.desktop_settings_files(system)), system)
+    host = diskspace.free_at(folder) if folder and system != "linux" else None
+    return diskspace.least(docker_vm_free(), host), folder or "", True
+
+
+def space_places():
+    """Where the server needs free space: the server folder and Docker's storage, each with
+    what it has free (None when setup cannot tell) and what it still needs."""
+    places = [diskspace.Place("folder", ROOT, diskspace.drive_label(ROOT), diskspace.free_at(ROOT), diskspace.FOLDER)]
+    need = diskspace.DOCKER
+    if not have_image("psu-extract:local"):
+        need += diskspace.BUILDER
+    if not volume_exists(cache_volume()):
+        need += diskspace.CACHE
+    free, where, desktop = docker_space()
+    label = diskspace.drive_label(where) if desktop and os.name == "nt" and where else ""
+    places.append(diskspace.Place("docker", where, label, free, need))
+    return places
+
+
+def tell_short(place):
+    have, want = diskspace.size(place.free), diskspace.need(place.need)
+    if place.what == "folder":
+        say("There is not enough free space for the server in %s (it needs about %s, that drive has %s free)."
+            % (place.path, want, have))
+        say("Make room there, or run setup with --folder pointing at a folder on another drive.")
+        return
+    say("Docker keeps the server program, the game data builder and the unpacked discs in its own")
+    say("storage%s. It needs about %s there, and has %s free." % (" (on %s)" % place.label if place.label else "",
+                                                                  want, have))
+    if host_system() in ("windows", "mac"):
+        say("Make room, or move Docker's storage to another drive:")
+        for line in MOVE_DOCKER_DISK:
+            say(line)
+    else:
+        say("Make room on that disk, or move Docker's data to a bigger disk: %s" % DOCKER_DATA_ROOT)
+
+
+def check_space():
+    """Before building or updating: when a place is short of space, say so and let the host
+    make room or carry on anyway. True to go on (also when setup cannot tell); unattended, a
+    known shortage stops the run."""
+    accepted = set()
+    while True:
+        with proglib.Slow("Docker is slow to answer. If Docker Desktop is just starting, this can take a minute."):
+            places = space_places()
+        todo = [p for p in places if diskspace.short(p) and p.what not in accepted]
+        if not todo:
+            return True
+        say()
+        tell_short(todo[0])
+        if UNATTENDED:
+            return False
+        pick = ask_choice("", ["Check again (once you have made room)", "Carry on anyway",
+                               "Stop for now (nothing is changed)"], 1)
+        if pick == 3:
+            return False
+        if pick == 2:
+            accepted.add(todo[0].what)
+
+
+def show_space():
+    """The menu's Check free space."""
+    with proglib.Slow("Docker is slow to answer."):
+        places = space_places()
+    for place in places:
+        if place.free is None:
+            say("Setup could not tell how much free space %s has." % ("Docker" if place.what == "docker" else ROOT))
+            continue
+        where = "The server folder (%s)" % place.path if place.what == "folder" else \
+            "Docker's storage" + (" (on %s)" % place.label if place.label else "")
+        say("%s: %s free, needs about %s.%s" % (where, diskspace.size(place.free), diskspace.need(place.need),
+                                                " Not enough." if diskspace.short(place) else ""))
 
 
 def failed(what, tail):
@@ -1011,17 +1521,61 @@ def post_json(url, body, timeout=20):
     return status, answer if isinstance(answer, dict) else {}
 
 
+def updater_block(folder=None):
+    """How the panel's updater updates this server (OpenLobby docs/installs.md, "Updates"): the
+    server folder as this computer sees it, and the command it runs there."""
+    return {"folder": folder or ROOT, "command": list(UPDATER_COMMAND), "timeout_minutes": UPDATER_TIMEOUT}
+
+
+def updater_valid(block):
+    """True when the block keeps the panel's rules: argv starting with python or python3, at
+    most 16 items under 200 characters each, a timeout of 5 to 240 minutes."""
+    command = block.get("command")
+    return (isinstance(block.get("folder"), str) and bool(block["folder"]) and isinstance(command, list)
+            and 1 <= len(command) <= 16 and command[0] in ("python", "python3")
+            and all(isinstance(a, str) and len(a) < 200 for a in command)
+            and isinstance(block.get("timeout_minutes"), int) and 5 <= block["timeout_minutes"] <= 240)
+
+
+def updater_key(block):
+    """What .env keeps of the block the panel has (OPENLOBBY_UPDATER), to tell when it changed."""
+    return hashlib.sha256(json.dumps(block, sort_keys=True).encode()).hexdigest()[:16]
+
+
+UPDATER_APPROVAL = ("The panel's owner allows its one-click Update once, under Settings > Modules in the "
+                    "panel. Until then the panel shows how to update by hand.")
+NO_UPDATER = "This panel does not run updates itself: to update, run PSU Server Setup and choose Update."
+
+
+def updater_held(answer):
+    """The key to keep in .env once the panel holds the updater block. A panel that ignores it
+    (one from before the one-click Update) gets it again on the next start, so an install
+    paired with it gains the button when the panel is updated."""
+    return updater_key(updater_block()) if isinstance(answer, dict) and "updater" in answer else ""
+
+
+def updater_note(answer):
+    """What to tell the host about the panel's one-click Update, from the panel's answer: a
+    panel that takes the updater block says how it holds it."""
+    return UPDATER_APPROVAL if isinstance(answer, dict) and "updater" in answer else NO_UPDATER
+
+
+PANEL_ANSWER = [{}]     # the panel's last answer to /api/pair or /api/pair/update
+
+
 def pair(panel_url, code, token):
     """Pair this server with the panel by the code it shows (docs/installs.md in OpenLobby,
     "Pairing"). Returns (result, message, pairing): result is "paired", "retry" (the same code
     can be typed again once the cause is fixed), "new code" (make another in the panel) or
     "stop" (pairing cannot work here)."""
     status, answer = post_json(panel_url + "/api/pair", {"code": code, "key": "psu", "title": GAME_TITLE,
-                                                         "url": PANEL_ADMIN_URL, "token": token})
+                                                         "url": PANEL_ADMIN_URL, "token": token,
+                                                         "updater": updater_block()})
+    PANEL_ANSWER[:] = [answer]
     error = answer.get("error") or ""
     if status == 200 and answer.get("ok") and answer.get("pairing"):
         title = answer.get("title") or GAME_TITLE
-        return "paired", "Paired. %s shows in the panel now." % title, answer["pairing"]
+        return "paired", "Paired. %s shows in the panel now. %s" % (title, updater_note(answer)), answer["pairing"]
     if status == 0:
         return "stop", "Setup could not reach the panel at %s. Is it running?" % panel_url, ""
     if status == 400 and "POL_ADMIN_GAME_" in error:
@@ -1039,10 +1593,13 @@ def pair(panel_url, code, token):
 
 
 def pair_update(panel_url, pairing, token):
-    """Tell the panel about a new token. Returns (ok, message)."""
+    """Tell the panel about a new token, or a moved folder or updater command (it sends the
+    updater block each time). Returns (ok, message)."""
     status, answer = post_json(panel_url + "/api/pair/update", {"key": "psu", "pairing": pairing, "token": token,
-                                                                "url": PANEL_ADMIN_URL})
+                                                                "url": PANEL_ADMIN_URL, "updater": updater_block()})
+    PANEL_ANSWER[:] = [answer]
     if status == 200:
+        write_env({"OPENLOBBY_UPDATER": updater_held(answer)})
         return True, "The panel has the new token."
     if status in (403, 404):
         return False, ("The panel no longer knows this server (%s) Pair again: Pair with an OpenLobby admin panel."
@@ -1082,7 +1639,7 @@ def pair_flow(panel_url, ask_first=True):
         result, message, pairing = pair(panel_url, code, read_env().get("PSU_PANEL_TOKEN", ""))
         say(message)
         if result == "paired":
-            write_env({"OPENLOBBY_PAIRING": pairing})
+            write_env({"OPENLOBBY_PAIRING": pairing, "OPENLOBBY_UPDATER": updater_held(PANEL_ANSWER[0])})
             return True
         if result == "stop":
             return False
@@ -1119,6 +1676,22 @@ def new_panel_token():
     else:
         say("Saved.")
     return False
+
+
+def check_updater():
+    """When this server is paired and its folder or update command changed since the panel last
+    heard of them, tell the panel (it then asks its owner to allow the one-click Update again)."""
+    env = read_env()
+    if not env.get("OPENLOBBY_PAIRING") or env.get("OPENLOBBY_UPDATER") == updater_key(updater_block()):
+        return
+    panel = find_panel()
+    if not panel:
+        return
+    ok, message = pair_update(panel, env["OPENLOBBY_PAIRING"], env.get("PSU_PANEL_TOKEN", ""))
+    if ok:
+        say("Setup told the OpenLobby panel where this server is now. " + updater_note(PANEL_ANSWER[0]))
+    else:
+        say(message)
 
 
 # --- update state for the panel -----------------------------------------------------------
@@ -1215,20 +1788,81 @@ def refresh_update_state(latest=None):
 
 # --- finishing ---------------------------------------------------------------------------
 
+def tell_line(env, choices):
+    """The one line to send players."""
+    address = env.get("PSU_GAME_ADDR", "")
+    if who_plays(env, choices) == "home" and choices.get("dns", True):
+        return ("Tell your players: primary DNS %s, a DNAS-bypassed disc (PLAYING.md), any new user ID."
+                % (lan_address() or address))
+    return ("Tell your players: the game's names lead to %s, a DNAS-bypassed disc (PLAYING.md), any new "
+            "user ID." % address)
+
+
+def players_note(env, choices):
+    """The text of "What to tell players.txt"."""
+    address = env.get("PSU_GAME_ADDR", "")
+    lines = [choices.get("name") or DEFAULT_NAME, "", tell_line(env, choices), "",
+             "The names the discs look up, which have to lead to %s:" % address]
+    lines += ["    " + name for name in GAME_NAMES]
+    if who_plays(env, choices) == "home":
+        lines += ["", "This is this computer's address on your home network. Only people on your home "
+                      "network can join."]
+    else:
+        lines += ["", "Players elsewhere run tools/devdns.py at their home (python devdns.py --answer %s) and "
+                      "set their console's DNS to that computer." % address,
+                  "Friends can join once the ports are open on your router."]
+    lines += ["", "In PCSX2 the DNS goes in Settings > Network & HDD (DNS mode Manual). PCSX2 players can use",
+              "the pnach files in the patches folder for the DNAS bypass; others need a patched disc image",
+              "(Make a patched disc image for a player, in PSU Server Setup's menu).",
+              "", "Run PSU Server Setup to see this again: it shows it at the top."]
+    return "\n".join(lines) + "\n"
+
+
+def save_players_note(env, choices):
+    """Write "What to tell players.txt" in the server folder; its path, or "" when it cannot be."""
+    if not env.get("PSU_GAME_ADDR"):
+        return ""
+    try:
+        with open(NOTE, "w", encoding="utf-8") as f:
+            f.write(players_note(env, choices))
+    except OSError:
+        return ""
+    return NOTE
+
+
+def show_status(env, choices):
+    """The lines above the menu: whether the server runs, and what to tell players."""
+    running = server_running()
+    say()
+    say("=" * 72)
+    if running:
+        say("Your server is running.")
+    elif not has_data(env):
+        say("Your server is not ready: the game data is not built yet. Choose 1 to build it.")
+    else:
+        say("Your server is stopped. Choose 1 to start it.")
+    if env.get("PSU_GAME_ADDR"):
+        say(tell_line(env, choices))
+        note = save_players_note(env, choices)
+        if note:
+            say("This and the names the discs look up are saved in %s" % note)
+    try:
+        with open(UPDATE_FILE, encoding="utf-8") as f:
+            if json.load(f).get("update") == "available":
+                say("A newer version is out: choose Update.")
+    except (OSError, ValueError, AttributeError):
+        pass
+    say("=" * 72)
+
+
 def finish(env, choices):
     address = env["PSU_GAME_ADDR"]
     home = who_plays(env, choices) == "home"
-    dns = choices.get("dns", True)
-    dns_at = lan_address() or address
     say()
     say("=" * 72)
     say("Your server is running.")
     say()
-    if home and dns:
-        say("Tell your players: primary DNS %s, a DNAS-bypassed disc (PLAYING.md), any new user ID." % dns_at)
-    else:
-        say("Tell your players: the game's names lead to %s, a DNAS-bypassed disc (PLAYING.md), any new "
-            "user ID." % address)
+    say(tell_line(env, choices))
     say()
     say("The names the discs look up, which have to lead to %s:" % address)
     for name in GAME_NAMES:
@@ -1248,6 +1882,9 @@ def finish(env, choices):
             say("Friends can join once the ports are open on your router (Open the router ports again).")
         say("Setup cannot test the internet side from inside your home. Ask a friend to try.")
     say()
+    note = save_players_note(env, choices)
+    if note:
+        say("This is also saved in %s" % note)
     say("The server keeps running when you close this window, as long as Docker runs.")
     say("Run PSU Server Setup again to stop it, update it, make backups or pair it with a panel.")
     say("=" * 72)
@@ -1257,8 +1894,8 @@ def first_run(dry_run=False):
     say("PSU Server Setup")
     say("================")
     say("This sets up a Phantasy Star Universe server on this computer. Answer three questions,")
-    say("then setup builds everything. The first time takes 30 to 40 minutes and needs the internet;")
-    say("you can leave it running.")
+    say("then setup builds everything. The first time takes about 10 minutes and downloads about")
+    say("800 MB, so it needs the internet; you can leave it running.")
     env = read_env(ENV_EXAMPLE)
     choices = read_choices()
     who = ask_who()
@@ -1283,8 +1920,12 @@ def first_run(dry_run=False):
                 say("  %s=%s" % (key, "(default)" if value is None else value))
         say("  PSU_PANEL_TOKEN: made at random")
         return
+    if not check_space():
+        say("Nothing was written. Run PSU Server Setup again once there is room.")
+        return
     if not ask_yes("Start?"):
         return
+    changes["COMPOSE_PROJECT_NAME"] = PROJECT
     write_env(changes)
     env = read_env()
     write_choices(choices)
@@ -1323,7 +1964,10 @@ def complete_setup(env, choices):
         if not has_data(env):
             ensure_discs(choices)
             if not build_game_data(env, choices, progress, log):
-                say("Fix the cause, then run PSU Server Setup again and choose Rebuild the game data.")
+                if choices.get("build") == "crashed":
+                    say("Run PSU Server Setup again once Docker runs: it carries on where the build stopped.")
+                else:
+                    say("Fix the cause, then run PSU Server Setup again and choose Rebuild the game data.")
                 return False
         env = read_env()
         refresh_update_state()
@@ -1458,69 +2102,191 @@ def stop_server():
         say("Stopped. It starts again when you choose Start the server.")
 
 
-def update():
-    """Fetch the new version, rebuild the image, and rebuild the game data when its builder changed."""
-    before = tree_digest("extract")
+class UpdateFailed(Exception):
+    """An update that stopped; its text is the one sentence that says why."""
+
+
+def take_lock():
+    """state/update.lock, so two updates (this window and the panel's updater) never run at
+    once. False when another one holds it; a lock older than the updater's timeout is left over
+    from one that was stopped."""
+    os.makedirs(os.path.dirname(LOCK), exist_ok=True)
+    for _ in range(2):
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(LOCK) < (UPDATER_TIMEOUT + 10) * 60:
+                    return False
+                os.remove(LOCK)
+            except OSError:
+                pass
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump({"started": utc_now(), "host": socket.gethostname(), "pid": os.getpid()}, f)
+        return True
+    return False
+
+
+def drop_lock():
+    try:
+        os.remove(LOCK)
+    except OSError:
+        pass
+
+
+def fetch_release(latest):
+    """Download a release's zip and put its files in the server folder (KEEP stays)."""
+    say("Downloading %s..." % latest["tag"])
+    archive = os.path.join(ROOT, "logs", "update.zip")
+    os.makedirs(os.path.dirname(archive), exist_ok=True)
+    try:
+        urllib.request.urlretrieve(latest["zip"], archive)
+        unpack_server(archive, ROOT, {"tag": latest["tag"], "commit": latest["commit"], "date": latest["date"]})
+    except (OSError, zipfile.BadZipFile) as e:
+        raise UpdateFailed("Downloading %s failed (%s), so nothing was changed." % (latest["tag"], e))
+    finally:
+        if os.path.exists(archive):
+            os.remove(archive)
+    say("Updated the server's files to %s." % latest["tag"])
+
+
+def run_update(force=False):
+    """Bring the server to the newest release without asking anything: the files (never older
+    ones), the server program, the game data when its builder changed (only the changed steps
+    run again), a restart when it was running, and state/update.json. Each step says so in a
+    line; a rerun after a failure carries on. Raises UpdateFailed. force builds the server
+    program even when nothing is new."""
+    if not take_lock():
+        raise UpdateFailed("Another update of this server is running now.")
+    try:
+        _run_update(force)
+    finally:
+        drop_lock()
+
+
+def _run_update(force):
+    say("Step 1 of 5: looking for the newest release of %s" % REPO)
+    if not wait_for_docker(wait=False):
+        raise UpdateFailed("Docker is not running, so nothing was updated.")
     latest = None
+    changed = read_choices().get("files_updated", False)
     if os.path.exists(os.path.join(ROOT, ".git")):
+        before = installed_version().get("commit")
         if run(["git", "pull", "--ff-only"], check=False).returncode != 0:
-            say("git pull failed (local changes?). Nothing was changed.")
-            return
+            raise UpdateFailed("git pull failed in the server folder (local changes?), so nothing was changed.")
+        changed = changed or installed_version().get("commit") != before
     else:
         latest = latest_release()
         if not latest:
-            say("Could not reach %s. Check the internet connection." % RELEASES)
-            return
-        if latest["tag"] == installed_version().get("tag"):
-            say("This is the newest version (%s)." % latest["tag"])
+            raise UpdateFailed((NO_RELEASE or ["Setup could not reach GitHub to look for a newer release."])[0])
+        installed = installed_version()
+        order = compare_versions(latest, installed)
+        if order == "older":
+            say("The server's files (%s) are newer than the newest release (%s): they stay."
+                % (shown_version(installed), shown_version(latest)))
+        elif order == "newer":
+            fetch_release(latest)
+            changed = True
+            if FROZEN:
+                say("A new PSU Server Setup is also on %s" % RELEASES)
+        else:
+            say("The server's files are the newest release (%s)." % shown_version(latest))
+    if changed:
+        # Kept until the server program is built from the new files, so a rerun after a
+        # failure still builds it.
+        choices = read_choices()
+        choices["files_updated"] = True
+        write_choices(choices)
+    env = read_env()
+    was_running = server_running()
+    needs_data = not data_current(env)
+    say("Step 2 of 5: checking free space")
+    if (changed or force or needs_data) and not check_space():
+        raise UpdateFailed("There is not enough free disk space for the update.")
+    progress = proglib.Progress()
+    with log_file() as log:
+        say("Step 3 of 5: building the server program")
+        if changed or force or not env.get("PSU_BUILD_COMMIT") \
+                or env.get("PSU_BUILD_COMMIT") != installed_version().get("commit", ""):
+            if not build_image(progress, log):
+                raise UpdateFailed("Building the server program failed; see %s." % LOG)
+        else:
+            say("The server program is up to date.")
+        choices = read_choices()
+        choices.pop("files_updated", None)
+        write_choices(choices)
+        say("Step 4 of 5: the game data")
+        if needs_data:
+            if not choices.get("discs"):
+                raise UpdateFailed("The game data has to be built, and setup does not know where the discs are: "
+                                   "run PSU Server Setup on the server's computer.")
+            say("The game data builder changed: building the game data again (only what changed).")
+            compose("stop", "game", check=False, capture=True)
+            if not build_game_data(env, choices, progress, log):
+                raise UpdateFailed("Building the game data failed; see %s." % LOG)
+        else:
+            say("The game data is up to date.")
+        say("Step 5 of 5: %s" % ("restarting the server" if was_running else "the server stays stopped"))
+        if was_running and not start_server(progress, log):
+            raise UpdateFailed("The server did not start again after the update; see %s." % LOG)
+    doc = refresh_update_state(latest)
+    say("Update state: %s%s" % (doc["update"], " (%s)" % doc["why"] if doc.get("why") else ""))
+    say("The update is done.")
+
+
+def update():
+    """The menu's Update."""
+    force = False
+    if not os.path.exists(os.path.join(ROOT, ".git")):
+        latest = latest_release()
+        if latest and compare_versions(latest, installed_version()) == "same" and data_current(read_env()):
+            say("This is the newest version (%s)." % shown_version(latest))
             if not ask_yes("Rebuild the server program anyway?", False):
                 refresh_update_state(latest)
                 return
-        else:
-            say("Downloading %s..." % latest["tag"])
-            archive = os.path.join(ROOT, "logs", "update.zip")
-            os.makedirs(os.path.dirname(archive), exist_ok=True)
-            try:
-                urllib.request.urlretrieve(latest["zip"], archive)
-                unpack_server(archive, ROOT, {"tag": latest["tag"], "commit": latest["commit"],
-                                              "date": latest["date"]})
-            except (OSError, zipfile.BadZipFile) as e:
-                say("The download failed (%s). Nothing was changed." % e)
-                return
-            finally:
-                if os.path.exists(archive):
-                    os.remove(archive)
-            say("Updated the server's files to %s." % latest["tag"])
-            if FROZEN:
-                say("A new PSU Server Setup is also on %s" % RELEASES)
-    progress = proglib.Progress()
-    with log_file() as log:
-        if not build_image(progress, log):
-            return
-    refresh_update_state(latest)
-    if tree_digest("extract") != before:
-        say("This update changes the game data builder: building the game data again.")
-        rebuild_data(ask_first=False)
+            force = True
+    try:
+        run_update(force)
+    except UpdateFailed as e:
+        say(str(e))
         return
-    prepare_start()
-    compose("up", "-d", "--remove-orphans")
-    if wait_ready():
+    if server_running():
         smoke()
 
 
 def rebuild_data(ask_first=True):
+    done = follow_running_build()
+    if done is not None:
+        if done:
+            with log_file() as log:
+                start_server(proglib.Progress(), log)
+        return
     env, choices = read_env(), read_choices()
+    fresh = False
     if ask_first:
-        say("This builds the game data again from your discs. The server is stopped meanwhile.")
-        if not ask_yes("Go on?", False):
-            return
+        if game_data(env, choices) == "partial":
+            say("The last game data build stopped part way. The server is stopped while it builds.")
+            pick = ask_choice("What do you want to do?", ["Carry on where it stopped",
+                                                         "Build it all again from the start",
+                                                         "Go back"])
+            if pick == 3:
+                return
+            fresh = pick == 2
+        else:
+            say("This builds the game data again from your discs. The server is stopped meanwhile.")
+            if not ask_yes("Go on?", False):
+                return
+            fresh = True
         if choices.get("discs") and not ask_yes("Use the same discs as last time?"):
             ensure_discs(choices, ask_again=True)
     ensure_discs(choices)
+    if ask_first and not check_space():
+        return
     compose("stop", "game", check=False)
     progress = proglib.Progress()
     with log_file() as log:
-        if not build_game_data(env, choices, progress, log):
+        if not build_game_data(env, choices, progress, log, fresh=fresh):
             say("The game stays stopped until the game data is built.")
             return
         start_server(progress, log)
@@ -1707,6 +2473,137 @@ def uninstall():
     raise SystemExit(0)
 
 
+# --- picking up where setup stopped -------------------------------------------------------
+
+def follow_running_build(build=None):
+    """When a game data build runs, say how far it got and follow it to the end. None when
+    none runs, else True when it built everything."""
+    build = build or build_container()
+    if not build or build[1] != "running":
+        return None
+    choices = read_choices()
+    history = build_history(build[0], choices)
+    say()
+    say("The game data is still being built: %s." % history[0].summary())
+    say("You can watch it here, or close this window: the build keeps going.")
+    with log_file() as log:
+        return follow_build(build[0], choices, proglib.Progress(), log, history)
+
+
+def resume():
+    """Pick up a setup that did not finish: follow a build that still runs, or offer to carry
+    on with one that stopped."""
+    build = build_container()
+    done = follow_running_build(build)
+    if done is not None:
+        if not done and read_choices().get("build") != "crashed":
+            say("Fix the cause, then choose Rebuild the game data.")
+        elif done and not server_running():
+            complete_setup(read_env(), read_choices())
+        return
+    env, choices = read_env(), read_choices()
+    state = game_data(env, choices)
+    if build:
+        # A build that ended while setup was closed.
+        if state != "built" and build_crashed(build[0], [], build[2]):
+            say()
+            say(DOCKER_STOPPED)
+            choices["build"] = "crashed"
+            write_choices(choices)
+        elif state != "built" and build[2] not in (None, 0, 137, 143, 255):
+            failed("The game data build stopped with an error.",
+                   docker_output(["docker", "logs", "--tail", "30", build[0]])[1].splitlines())
+        docker_output(["docker", "rm", build[0]])
+    if state == "built" and choices.get("build") in ("started", "crashed"):
+        # The build finished while setup was closed, so setup never got to start the server.
+        choices["build"] = "done"
+        write_choices(choices)
+        if not server_running():
+            say()
+            say("The game data finished building while setup was closed. Starting the server.")
+            if complete_setup(env, choices):
+                offer_panel()
+        return
+    if state == "built" or not choices.get("discs"):
+        return
+    say()
+    say("Setup did not finish last time: the game data is %s." % ("only partly built" if state == "partial"
+                                                                  else "not built yet"))
+    if ask_yes("Carry on where it stopped?"):
+        if complete_setup(env, choices):
+            offer_panel()
+
+
+def finish_carried_update():
+    """A newer PSU Server Setup put new files here: build what they need (the server program,
+    the game data when its builder changed), once Docker runs."""
+    if not read_choices().get("files_updated"):
+        return
+    build = build_container()
+    if build and build[1] == "running":
+        return      # resume() follows the build first; the next start finishes the update
+    say("Building the server program from the new files...")
+    try:
+        run_update()
+    except UpdateFailed as e:
+        say(str(e))
+
+
+# --- starting over -----------------------------------------------------------------------
+
+def start_over():
+    """Delete the game data, the unpacked discs and setup's answers, then ask the first
+    questions again. The accounts and characters stay unless the host asks. True when it did."""
+    heading("Start over")
+    say("This deletes:")
+    say("  - the game data built from your discs (%s) and the unpacked discs in Docker" % data_dir(read_env()))
+    say("  - the server's settings (the .env file) and the answers you gave setup")
+    say("It keeps:")
+    say("  - every player account and character (%s), unless you say so below" % state_dir(read_env()))
+    say("  - your backups (%s) and your disc files" % BACKUPS)
+    say()
+    accounts_too = ask_yes("Also delete every player account and character?", False)
+    answer = ask('To go ahead, type "start over" (or just press Enter to cancel)')
+    if answer.strip().strip('"').lower() != "start over":
+        say("Nothing was deleted.")
+        return False
+    if accounts_too and server_running():
+        say("Making a backup of the accounts first...")
+        backup(quiet=True)
+    wipe(accounts_too)
+    say()
+    say("Done. Now the setup questions again.")
+    first_run()
+    return True
+
+
+def wipe(accounts_too):
+    """Remove the containers, the extract cache, the game data and setup's files (and the
+    accounts with accounts_too). The images and backups stay."""
+    env = read_env()
+    say("Stopping the server and deleting...")
+    code, out = docker_output(["docker", "ps", "-aq", "--filter", "label=com.docker.compose.project=%s" % PROJECT])
+    if code == 0 and out.split():
+        docker_output(["docker", "rm", "-f"] + out.split())
+    if volume_exists(cache_volume()):
+        code, out = docker_output(["docker", "volume", "rm", cache_volume()])
+        if code != 0:
+            say("  Could not delete %s: %s" % (cache_volume(), out.strip()))
+    folders = [(data_dir(env), os.path.join(ROOT, "data"))]
+    if accounts_too:
+        folders.append((state_dir(env), os.path.join(ROOT, "state")))
+    for d, ours in folders:
+        if os.path.normpath(d) != os.path.normpath(ours):
+            say("  %s was left alone (it is not setup's folder)." % d)
+        elif os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+            if os.path.exists(d):
+                say("  Some of %s could not be deleted." % d)
+    for path in (ENV, CHOICES, NOTE, UPDATE_FILE):
+        if os.path.exists(path):
+            os.remove(path)
+
+
 MENU = [("Start the server", start_server_menu),
         ("Stop the server", stop_server),
         ("Show what to tell players", tell_players),
@@ -1721,19 +2618,15 @@ MENU = [("Start the server", start_server_menu),
         ("Show what the server is doing (logs)", logs),
         ("Check that the server works", smoke),
         ("Open the router ports again", router_again),
+        ("Check free space", show_space),
+        ("Start over (deletes the game data and setup's answers, keeps the accounts)", start_over),
         ("Remove the server from this computer", uninstall)]
-
-
-def menu_status(env):
-    if not has_data(env):
-        return "game data not built yet"
-    return "running" if server_running() else "stopped"
 
 
 def menu():
     while True:
-        env = read_env()
-        heading("PSU server: %s (address %s)" % (menu_status(env), env.get("PSU_GAME_ADDR", "?")))
+        show_status(read_env(), read_choices())
+        heading("What do you want to do?")
         for i, (title, _) in enumerate(MENU, 1):
             say("  %2d. %s" % (i, title))
         say("   0. Quit")
@@ -1749,6 +2642,20 @@ def menu():
                 if e.code == 0:
                     raise
                 say(str(e))
+            except Exception as e:
+                trouble(e)
+
+
+def trouble(e):
+    """An unexpected error: say so plainly and keep the details in the log."""
+    say()
+    say("Something went wrong: %s" % (str(e) or type(e).__name__))
+    try:
+        with log_file() as log:
+            log.write(traceback.format_exc())
+        say("The details are in %s" % LOG)
+    except OSError:
+        say(traceback.format_exc())
 
 
 def parse_args(argv=None):
@@ -1762,16 +2669,55 @@ def parse_args(argv=None):
                          "writes nothing and needs no Docker")
     ap.add_argument("--backup", action="store_true",
                     help="make a backup of the accounts and quit (for a scheduled task or cron)")
-    ap.add_argument("--project", default=os.environ.get("PSU_SETUP_PROJECT", "psu"),
-                    help="the Docker Compose project name (default psu)")
+    ap.add_argument("--project", default=os.environ.get("PSU_SETUP_PROJECT"),
+                    help="the Docker Compose project name (default: the one in .env, else psu)")
+    ap.add_argument("--update", action="store_true",
+                    help="update to the newest release and quit (with --yes, asks nothing)")
+    ap.add_argument("--yes", action="store_true",
+                    help="never ask: take the safe answer or stop (for an OpenLobby panel's updater)")
+    ap.add_argument("--check-update", action="store_true",
+                    help="look for a newer release, write state/update.json for the panel and quit")
     return ap.parse_args(argv)
 
 
+def unattended(args):
+    """--update / --check-update: one line per step, exit 0 when done, else 1 with the reason
+    as the last line."""
+    try:
+        if not os.path.exists(ENV):
+            raise UpdateFailed("This server is not set up yet: run PSU Server Setup on its computer first.")
+        if args.check_update:
+            doc = refresh_update_state()
+            say("Update state: %s%s" % (doc["update"], " (%s)" % doc["why"] if doc.get("why") else ""))
+            return 0
+        run_update()
+        return 0
+    except UpdateFailed as e:
+        say(str(e))
+    except SystemExit as e:
+        say(str(e) if e.code not in (None, 0, 1) else "The update stopped.")
+    except Exception as e:
+        try:
+            with log_file() as log:
+                log.write(traceback.format_exc())
+        except OSError:
+            pass
+        say("The update stopped on an unexpected error: %s." % (str(e) or type(e).__name__))
+    return 1
+
+
 def main(argv=None):
-    global PROJECT
+    global PROJECT, UNATTENDED
     args = parse_args(argv)
-    PROJECT = args.project
     use_root(find_root(args.folder))
+    PROJECT = args.project or read_env().get("COMPOSE_PROJECT_NAME") or "psu"
+    if args.yes or args.check_update:
+        UNATTENDED = True
+    if args.update or args.check_update:
+        if not args.yes and not args.check_update and not sys.stdin.isatty():
+            UNATTENDED = True
+        os.chdir(ROOT)
+        sys.exit(unattended(args))
     try:
         if args.dry_run:
             say("Server folder: %s%s" % (ROOT, "" if os.path.exists(os.path.join(ROOT, "compose.yml")) else
@@ -1790,18 +2736,19 @@ def main(argv=None):
         if not os.path.exists(ENV):
             first_run()
             return
-        env = read_env()
-        if not has_data(env) and read_choices().get("discs"):
-            say("Setup did not finish last time.")
-            if ask_yes("Carry on where it stopped?"):
-                if complete_setup(env, read_choices()):
-                    offer_panel()
-                return
+        if not read_env().get("COMPOSE_PROJECT_NAME"):
+            # The panel's updater runs setup.py with no --project: it reads the name from here.
+            write_env({"COMPOSE_PROJECT_NAME": PROJECT})
+        resume()
+        finish_carried_update()
         refresh_update_state()
+        check_updater()
         menu()
     except KeyboardInterrupt:
         say()
         sys.exit(1)
+    except Exception as e:
+        trouble(e)
 
 
 if __name__ == "__main__":

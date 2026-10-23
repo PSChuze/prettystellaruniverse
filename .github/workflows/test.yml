@@ -19,7 +19,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Setup tests
-        run: python -m unittest tests.test_setup tests.test_setup_flow tests.test_setup_discs tests.test_setup_upnp tests.test_setup_panel
+        run: python -m unittest tests.test_setup tests.test_setup_flow tests.test_setup_discs tests.test_setup_upnp tests.test_setup_panel tests.test_setup_recover
       - name: Byte-compile
         run: python -m compileall -q server tools extract setup.py hostsetup packaging tests
       - name: No game data

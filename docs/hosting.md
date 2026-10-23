@@ -8,7 +8,7 @@ hand.
 ## What you need
 
 - A computer that stays on while people play: Windows 10 or 11, a Mac with Apple silicon, or Linux.
-  About 10 GB of free disk space.
+  About 6 GB of free disk space (setup checks before it builds).
 - Your own disc image of **Phantasy Star Universe** (SLUS-21194), of **Ambition of the Illuminus**
   (SLUS-21631), or of both, as `.iso` files ([discs.md](discs.md) says how to make one). The server's
   game data is built from them on your computer; none of it comes with the server.
@@ -30,9 +30,11 @@ hand.
 3. Double-click it. A window with text opens. If Docker Desktop is not running yet, setup starts it
    and waits.
 4. Answer the three questions (below).
-5. Wait. Setup shows one line per step and roughly how long it takes; the first time takes 30 to
-   40 minutes, mostly building the game data from your discs, and needs the internet once (the
-   lobby builder, EGS, is downloaded from GitHub).
+5. Wait. Setup shows one line per step and roughly how long it takes. The first time takes about 10
+   minutes and needs the internet: Docker downloads the programs (about 800 MB, most of it the game
+   data builder's Erlang); building the game data from your discs takes about 5
+   minutes and downloads the lobby builder, EGS, from GitHub once. If the window closes meanwhile,
+   the build keeps going: run setup again and it shows how far it got.
 6. At the end setup shows one line to send your players, like this:
 
    ```
@@ -40,7 +42,8 @@ hand.
    ```
 
 Setup puts the server's files in a folder called **PSU Server** in your home folder and says where it
-is. Everything it does is written to `logs/setup.log` in that folder.
+is. Everything it does is written to `logs/setup.log` in that folder. The line for your players is
+also saved there as `What to tell players.txt`, and setup shows it at the top every time it starts.
 
 ## The three questions
 
@@ -114,7 +117,10 @@ routers do not allow (no "NAT loopback"). If that happens, they use this compute
 
 ## Later: the menu
 
-Run PSU Server Setup again for a menu:
+Run PSU Server Setup again for a menu. Above it, setup says whether the server runs, the line for your
+players, and when a newer version is out. If the last run stopped part way (the window was closed, or
+Docker stopped), it carries on where it stopped: a game data build that is still running is followed
+again, and one that stopped picks up after the last step it finished.
 
 - **Start the server**, **Stop the server**. The server also starts by itself whenever Docker starts,
   so set Docker Desktop to start when you log in.
@@ -122,13 +128,29 @@ Run PSU Server Setup again for a menu:
 - **Change settings**: who plays and the address, the server's name and login notice, who can make an
   account, game masters, the DNS server, a new admin panel token.
 - **Update**: gets the newest release from GitHub, rebuilds the server and, when the game data builder
-  changed, the game data. Your accounts and settings stay.
+  changed, the game data (only the parts that changed). Your accounts, settings and backups stay.
+  Running a newer PSU Server Setup does the same for the server's files it carries; an older one
+  never puts older files back.
 - **Rebuild the game data**: from the same or other disc images.
 - **Pair with an OpenLobby admin panel** (below).
 - **Make a patched disc image for a player** (above).
 - **Make a backup**, **Restore a backup**, **Player accounts** (list, reset a password),
   **Show what the server is doing**, **Check that the server works**, **Open the router ports
-  again**, **Remove the server from this computer**.
+  again**, **Check free space**, **Remove the server from this computer**.
+- **Start over**: deletes the game data, the unpacked discs and setup's answers, then asks the three
+  questions again. Accounts and characters stay unless you say otherwise (setup makes a backup first
+  then). Type `start over` to confirm.
+
+## When something goes wrong
+
+- *The window closed while building*: run setup again. It finds the build (it kept running) and
+  follows it.
+- *"Docker stopped while building the game data"*: Docker Desktop stopped or ran out of memory.
+  Setup waits for it and carries on where the build stopped. The build itself needs little memory
+  (about 300 MB); when Docker has less than 2 GB, setup says how to give it more, and on Windows it
+  can set it in `.wslconfig` for you.
+- *Not enough free space*: setup says where (the server folder, or Docker's own storage) and how to
+  make room before it builds.
 
 ## OpenLobby admin panel
 
@@ -140,8 +162,16 @@ setup program and type the 8-character code it shows. That is all: the panel and
 other on the `openlobby` Docker network, and no token is copied by hand. To pair later, choose **Pair
 with an OpenLobby admin panel** in the menu.
 
-The panel also shows when a newer release is out and what changed; updating stays in setup (choose
-Update).
+The panel also shows when a newer release is out and what changed. Pairing also tells the panel how
+to update this server (the server folder and the command `python3 setup.py --update --yes`); its owner
+allows that once under Settings > Modules, and then the panel's Update button runs it. Until then, or
+without the panel's updater, the panel says to run setup and choose Update. When the server folder
+moves, setup tells the panel at its next start, and the owner allows it again.
+
+`python3 setup.py --update --yes` works by hand too (on Linux, or in a scheduled task): it asks
+nothing, prints one line per step (and at least one a minute), exits with 0 when done and otherwise
+ends with one line saying why; running it again carries on. `--check-update` only looks for a newer
+release.
 
 ## Backups
 

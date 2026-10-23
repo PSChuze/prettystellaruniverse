@@ -56,7 +56,11 @@ data/
   gamedata/            PSU_GAMEDATA: PSU's JSON tables
     aoti/              AotI's
   captures/            PSU_CAPTURE_DIR: ppcube.bin, packet170c.bin
+  .built               written last: the builder's fingerprint, the EGS commit and the disc serials
 ```
+
+`.built` is removed when a build starts and written after its last step, so PSU Server Setup counts the
+data as built only when it is there; a build that stopped half way is carried on, not served.
 
 With both discs, PSU's files sit at the top and AotI's in the `aoti/` subdirectories. With AotI alone, its
 tables and archives are only in `aoti/`, and the top level holds what both share (the EGS lobby quests).

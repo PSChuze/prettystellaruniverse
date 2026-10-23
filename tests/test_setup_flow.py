@@ -126,10 +126,16 @@ class Questions(unittest.TestCase):
 
 class FakeDocker:
     """Stands in for every docker command setup runs: records them and answers like a working
-    Docker Desktop on which nothing runs yet. `extract` writes a small DATA."""
+    Docker Desktop on which nothing runs yet. The detached extract run writes a small DATA,
+    marked built, and leaves an exited build container whose log `docker logs` gives."""
+
+    LOG = ["psu: Phantasy Star Universe (USA) (SLUS-21194)", "psu-disc ...", "psu-gamedata ...",
+           "done: /data (nbl/, gamedata/, captures/)"]
 
     def __init__(self, root):
         self.root, self.calls, self.networks = root, [], set()
+        self.build = None           # (id, state, exit code) of the extract container
+        self.exit = 0
 
     def answer(self, cmd):
         self.calls.append(cmd)
@@ -138,14 +144,28 @@ class FakeDocker:
             code = 0 if cmd[3] in self.networks else 1
         elif cmd[:3] == ["docker", "network", "create"]:
             self.networks.add(cmd[3])
+        elif cmd[:2] == ["docker", "ps"] and "label=com.docker.compose.service=extract" in cmd:
+            if self.build:
+                cid, state, exit_code = self.build
+                out = "%s\t%s\t%s\n" % (cid, state, "Up 1 minute" if state == "running" else
+                                         "Exited (%d) 1 second ago" % exit_code)
         elif cmd[:2] == ["docker", "ps"]:
             out = ""
+        elif cmd[:2] == ["docker", "logs"]:
+            out = "".join("2026-01-01T00:00:%02d.000000000Z %s\n" % (i, line) for i, line in enumerate(self.LOG))
+        elif cmd[:2] == ["docker", "rm"]:
+            self.build = None
+        elif cmd[:2] == ["docker", "inspect"]:
+            out = "false"
         elif "run" in cmd and "extract" in cmd:
-            data = os.path.join(self.root, "data")
-            for rel in ("nbl/lobby.nbl", "gamedata/items.json", "captures/ppcube.bin"):
-                os.makedirs(os.path.dirname(os.path.join(data, rel)), exist_ok=True)
-                open(os.path.join(data, rel), "w").close()
-            out = "psu: Phantasy Star Universe (USA) (SLUS-21194)\npsu-disc ...\npsu-gamedata ...\n"
+            if self.exit == 0:
+                data = os.path.join(self.root, "data")
+                for rel in ("nbl/lobby.nbl", "gamedata/items.json", "captures/ppcube.bin", ".built"):
+                    os.makedirs(os.path.dirname(os.path.join(data, rel)), exist_ok=True)
+                    with open(os.path.join(data, rel), "w") as f:
+                        f.write('{"fingerprint": "x"}' if rel == ".built" else "")
+            self.build = ("c0ffee", "exited", self.exit)
+            out = "psu-extract-run-1\n"
         return code, out
 
     def run(self, cmd, check=True, capture=False, **kw):
@@ -185,6 +205,8 @@ class FirstRun(unittest.TestCase):
                    mock.patch.object(discs, "likely_folders", return_value=[]),
                    mock.patch.object(discs, "search", return_value=[discs.Disc(disc, "psu")]),
                    mock.patch.object(setup, "PROJECT", "psupub-test"),
+                   mock.patch.object(setup, "check_space", return_value=True),
+                   mock.patch.object(setup, "docker_resources", return_value=(8 << 30, True)),
                    mock.patch("sys.stdout", self.out)]
         for p in patches:
             p.start()
@@ -203,8 +225,15 @@ class FirstRun(unittest.TestCase):
         self.assertIn(["--profile", "extract", "build", "extract"], compose)
         extract = next(c for c in compose if "run" in c)
         folder = os.path.dirname(self.disc).replace("\\", "/")
-        self.assertEqual(extract, ["--profile", "extract", "run", "--rm", "-v", folder + ":/discs/1:ro", "extract",
+        self.assertEqual(extract, ["--profile", "extract", "run", "-d", "-v", folder + ":/discs/1:ro", "extract",
                                    "--psu", "/discs/1/Phantasy Star Universe (USA).iso", "--out", "/data"])
+        self.assertIn(["docker", "logs", "-f", "-t", "--since", "2026-01-01T00:00:03.000000000Z", "c0ffee"],
+                      self.docker.calls)
+        self.assertIn(["docker", "rm", "c0ffee"], self.docker.calls)
+        self.assertEqual(setup.read_choices()["build"], "done")
+        self.assertEqual(env["COMPOSE_PROJECT_NAME"], "psupub-test")
+        with open(os.path.join(self.dir, "What to tell players.txt")) as f:
+            self.assertIn("primary DNS 10.0.0.20", f.read())
         self.assertIn(["up", "-d", "--remove-orphans"], compose)
         self.assertIn(["docker", "network", "create", "openlobby"], self.docker.calls)
         self.assertIn("Tell your players: primary DNS 10.0.0.20, a DNAS-bypassed disc (PLAYING.md), any new "
@@ -218,18 +247,17 @@ class FirstRun(unittest.TestCase):
         self.assertIn("Done: Building the game data", out)
 
     def test_a_failed_extract_says_what_to_do(self):
-        def fail(cmd, log, **kw):
-            self.docker.calls.append(cmd)
-            if "run" in cmd:
-                return 1, ["error: sha1 mismatch for /discs/1/PSU.iso"]
-            return 0, []
-        with mock.patch.object(proglib, "run_logged", fail), answers("1", "y", "", "", "y"):
+        self.docker.exit = 1
+        self.docker.LOG = ["error: sha1 mismatch for /discs/1/PSU.iso"]
+        with answers("1", "y", "", "", "y"):
             setup.first_run()
         out = self.out.getvalue()
         self.assertIn("Building the game data failed.", out)
         self.assertIn("not a plain copy of the retail disc", out)
         self.assertIn("choose Rebuild the game data", out)
         self.assertFalse(any("up" in c for c in self.docker.calls))
+        self.assertEqual(setup.read_choices()["build"], "failed")
+        self.assertFalse(setup.has_data(setup.read_env()))
 
 
 class SharedDns(unittest.TestCase):
@@ -298,7 +326,7 @@ class Menu(unittest.TestCase):
         called = []
         menu = [(t, (lambda t=t: called.append(t))) for t, _ in setup.MENU]
         with mock.patch.object(setup, "MENU", menu), mock.patch.object(setup, "read_env", return_value={}), \
-                mock.patch.object(setup, "menu_status", return_value="stopped"), \
+                mock.patch.object(setup, "show_status"), \
                 mock.patch("sys.stdout", io.StringIO()), answers("2", "x", "99", "7", "0"):
             setup.menu()
         self.assertEqual(called, ["Stop the server", "Pair with an OpenLobby admin panel"])
@@ -372,12 +400,14 @@ class Progress(unittest.TestCase):
         out = io.StringIO()
         now = [0.0]
         p = proglib.Progress(out, clock=lambda: now[0])
-        watch = proglib.ExtractWatcher(p)
+        watch = proglib.ExtractWatcher(p, ["psu", "aoti"])
         for line in ("psu: Phantasy Star Universe (USA) (SLUS-21194)", "psu-disc ...", "aoti-disc: up to date",
                      "  fetching EGS ceea04c3b438 from GitHub", "lobbies ...", "  12 zones", "psu-drops ..."):
             watch(line)
             now[0] += 120
-        self.assertEqual(p.detail, "step 4, psu-drops")
+        self.assertEqual(p.detail, "step 6 of 24, PSU drop tables")
+        watch("aoti-missions ...")
+        self.assertEqual(watch.summary(), "step 13 of 24, AotI missions and counters (about 2 minutes)")
         p.end()
         text = out.getvalue()
         self.assertIn("  Done: Reading your discs (4 minutes)\n", text)

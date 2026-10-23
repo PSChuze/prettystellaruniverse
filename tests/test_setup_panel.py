@@ -6,7 +6,7 @@ The stand-in also runs alone, for an end-to-end test with the server in Docker:
 
 It speaks the panel's side of the pairing contract and nothing else:
 
-  POST /api/pair         {"code", "key", "title", "url", "token"}
+  POST /api/pair         {"code", "key", "title", "url", "token", "updater" (optional)}
       -> 200 {"ok": true, "title", "pairing"}   the code was right; the panel probed
                                                <url>/openlobby/module.json with X-Devtool-Token
                                                and the module answered with this key
@@ -14,8 +14,11 @@ It speaks the panel's side of the pairing contract and nothing else:
                                                settings, or the probe failed (the code stays good)
       -> 403 {"error"}                         wrong, used or expired code
       -> 429 {"error"}                         more than 5 tries a minute from one address
-  POST /api/pair/update  {"key", "pairing", "token", "url" (optional)}
+  POST /api/pair/update  {"key", "pairing", "token", "url" (optional), "updater" (optional)}
       -> 200 {"ok": true}; 403 wrong pairing; 404 unknown key
+  "updater" is {"folder", "command" (argv starting with python or python3, at most 16 items
+  under 200 characters), "timeout_minutes" (5..240)}: a bad one is a 400; a new one waits as
+  "requested" until the owner allows it.
   GET  /paired           what it holds (for tests)
 
 --rewrite maps the module's host:port to one this process can reach (a test outside Docker).
@@ -43,6 +46,17 @@ sys.path[:0] = [os.path.join(HERE, ".."), os.path.join(HERE, "..", "server")]
 TRIES, WINDOW = 5, 60.0             # every try counts, per client address (the panel's Limiter)
 
 
+def updater_ok(block):
+    """The panel's rules for an updater block (absent is fine)."""
+    if block is None:
+        return True
+    command = block.get("command") if isinstance(block, dict) else None
+    return (isinstance(block, dict) and isinstance(block.get("folder"), str) and bool(block["folder"])
+            and isinstance(command, list) and 1 <= len(command) <= 16 and command[0] in ("python", "python3")
+            and all(isinstance(a, str) and len(a) < 200 for a in command)
+            and isinstance(block.get("timeout_minutes"), int) and 5 <= block["timeout_minutes"] <= 240)
+
+
 class Panel:
     """The answers the panel gives (OpenLobby services/adminpair.py), with the same error texts."""
 
@@ -51,7 +65,7 @@ class Panel:
         self.used = set()
         self.rewrite = dict(rewrite or {})
         self.env_keys = set(env_keys)       # keys the panel's own settings wire (POL_ADMIN_GAME_<KEY>_URL)
-        self.paired = {}                    # key -> {"title", "url", "token", "pairing"}
+        self.paired = {}                    # key -> {"title", "url", "token", "pairing", "updater"}
         self.hits = {}
         self.lock = threading.Lock()
 
@@ -102,6 +116,8 @@ class Panel:
         if key in self.env_keys:
             return 400, {"error": "This panel's settings already point %s at a game (POL_ADMIN_GAME_%s_URL). "
                                   "Take that out first." % (key, key.upper())}
+        if not updater_ok(body.get("updater")):
+            return 400, {"error": "updater: a folder, a python command and a timeout of 5 to 240 minutes."}
         title, why = self.probe(url, token, key)
         if why:
             return 400, {"error": why}          # the code stays good
@@ -111,8 +127,10 @@ class Panel:
             self.codes.discard(code)
             self.used.add(code)
             pairing = secrets.token_urlsafe(32)
-            self.paired[key] = {"title": title, "url": url, "token": token, "pairing": pairing}
-        return 200, {"ok": True, "title": title, "pairing": pairing}
+            self.paired[key] = {"title": title, "url": url, "token": token, "pairing": pairing,
+                                "updater": dict(body["updater"], state="requested") if body.get("updater") else None}
+        return 200, {"ok": True, "title": title, "pairing": pairing,
+                     "updater": {"state": "requested"} if body.get("updater") else None}
 
     def update(self, body):
         if not isinstance(body, dict) or not body:
@@ -124,9 +142,15 @@ class Panel:
                 return 404, {"error": "This panel has no game with the key %s." % key}
             if body.get("pairing") != known["pairing"]:
                 return 403, {"error": "That pairing secret is not this panel's for %s. Pair again." % key}
+            if not updater_ok(body.get("updater")):
+                return 400, {"error": "updater: a folder, a python command and a timeout of 5 to 240 minutes."}
             known["token"] = body.get("token") or known["token"]
             known["url"] = body.get("url") or known["url"]
-        return 200, {"ok": True}
+            if body.get("updater"):
+                old = {k: v for k, v in (known.get("updater") or {}).items() if k != "state"}
+                if old != body["updater"]:
+                    known["updater"] = dict(body["updater"], state="requested")
+        return 200, {"ok": True, "updater": {"state": (known.get("updater") or {}).get("state")}}
 
     def serve(self, port, bind="127.0.0.1"):
         panel = self
@@ -214,9 +238,12 @@ class Pairing(PanelCase):
     def test_pair_then_new_token(self):
         result, message, pairing = self.setup.pair(self.url, "ABCD2345", TOKEN)
         self.assertEqual(result, "paired", message)
-        self.assertEqual(message, "Paired. Phantasy Star Universe shows in the panel now.")
+        self.assertEqual(message, "Paired. Phantasy Star Universe shows in the panel now. " + self.setup.UPDATER_APPROVAL)
         held = self.panel.paired["psu"]
         self.assertEqual((held["url"], held["token"], held["pairing"]), ("http://psu:22191", TOKEN, pairing))
+        self.assertEqual(held["updater"], {"folder": self.setup.ROOT, "command": ["python3", "setup.py", "--update",
+                                                                                 "--yes"],
+                                           "timeout_minutes": 180, "state": "requested"})
         self.assertEqual(self.setup.pair_update(self.url, pairing, "n" * 32), (True, "The panel has the new token."))
         self.assertEqual(self.panel.paired["psu"]["token"], "n" * 32)
         ok, message = self.setup.pair_update(self.url, "wrong", "x" * 32)
@@ -312,7 +339,46 @@ class PairFlow(PanelCase):
                 mock.patch.object(self.setup, "write_env") as saved:
             self.assertTrue(self.setup.pair_flow(self.url, ask_first=False))
         self.assertIn("refused that token", out.getvalue())
-        saved.assert_called_once_with({"OPENLOBBY_PAIRING": self.panel.paired["psu"]["pairing"]})
+        saved.assert_called_once_with({"OPENLOBBY_PAIRING": self.panel.paired["psu"]["pairing"],
+                                       "OPENLOBBY_UPDATER": self.setup.updater_key(self.setup.updater_block())})
+        self.assertIn("allows its one-click Update once, under Settings > Modules", out.getvalue())
+        self.assertEqual(self.setup.updater_note({"ok": True, "pairing": "p"}), self.setup.NO_UPDATER)
+
+    def test_a_panel_without_the_updater_gets_it_once_it_learns_it(self):
+        real = {"pair": self.panel.pair, "update": self.panel.update}
+
+        def older(name):                            # a panel from before the one-click Update
+            def answer(body):
+                status, doc = real[name](dict(body, updater=None))
+                return status, {k: v for k, v in doc.items() if k != "updater"}
+            return answer
+        self.panel.pair, self.panel.update = older("pair"), older("update")
+        out = io.StringIO()
+        self.assertTrue(self.flow("y", "ABCD2345")[0])
+        self.assertEqual(self.setup.read_env().get("OPENLOBBY_UPDATER"), "")
+        self.panel.pair, self.panel.update = real["pair"], real["update"]       # the panel is updated
+        with mock.patch.object(self.setup, "find_panel", return_value=self.url), mock.patch("sys.stdout", out):
+            self.setup.check_updater()
+        self.assertEqual(self.panel.paired["psu"]["updater"]["state"], "requested")
+        self.assertEqual(self.setup.read_env().get("OPENLOBBY_UPDATER"),
+                         self.setup.updater_key(self.setup.updater_block()))
+        self.assertIn("allows its one-click Update once", out.getvalue())
+
+    def test_a_moved_folder_is_sent_again(self):
+        self.assertTrue(self.flow("y", "ABCD2345")[0])
+        self.panel.paired["psu"]["updater"]["state"] = "approved"
+        out = io.StringIO()
+        with mock.patch.object(self.setup, "find_panel", return_value=self.url), mock.patch("sys.stdout", out):
+            self.setup.check_updater()                      # nothing changed: nothing sent
+            self.assertEqual(self.panel.paired["psu"]["updater"]["state"], "approved")
+            self.setup.use_root(os.path.join(self.dir, "moved"))
+            os.makedirs(self.setup.ROOT)
+            shutil.copy(os.path.join(self.dir, ".env"), self.setup.ENV)
+            self.setup.check_updater()
+        held = self.panel.paired["psu"]["updater"]
+        self.assertEqual((held["folder"], held["state"]), (self.setup.ROOT, "requested"))
+        self.assertIn("told the OpenLobby panel where this server is now. The panel's owner allows", out.getvalue())
+
 
     def test_found_by_label(self):
         ps = mock.Mock(stdout="olpanel-admin-1\tolpanel\thttp://127.0.0.1:8090/\n", returncode=0)
@@ -321,6 +387,21 @@ class PairFlow(PanelCase):
         self.assertEqual(run.call_args[0][0][:4], ["docker", "ps", "--filter", "label=org.openlobby.role=panel"])
         with mock.patch.object(self.setup, "run", return_value=mock.Mock(stdout="", returncode=0)):
             self.assertEqual(self.setup.find_panel(), "")
+
+
+class UpdaterBlock(unittest.TestCase):
+    def test_shape_keeps_the_panels_rules(self):
+        import setup
+        block = setup.updater_block("/srv/PSU Server")
+        self.assertEqual(sorted(block), ["command", "folder", "timeout_minutes"])
+        self.assertTrue(setup.updater_valid(block) and updater_ok(block))
+        self.assertEqual(block["command"][0], "python3")
+        self.assertLessEqual(len(block["command"]), 16)
+        self.assertTrue(5 <= block["timeout_minutes"] <= 240)
+        for bad in (dict(block, command=["sh", "-c", "x"]), dict(block, timeout_minutes=300),
+                    dict(block, command=["python3"] + ["x"] * 16), dict(block, folder="")):
+            self.assertFalse(setup.updater_valid(bad))
+            self.assertFalse(updater_ok(bad))
 
 
 class UpdateState(unittest.TestCase):

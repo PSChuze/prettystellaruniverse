@@ -2,10 +2,14 @@
 
 Each step runs the tools in this directory as child processes (each stays runnable alone) with
 $PSU_EXTRACT_WORK set to the cache directory. A finished step leaves a stamp in <work>/stamps; a re-run skips a
-step whose stamp matches (same discs and output directory, outputs still there); --rebuild ignores the stamps.
-Once a step runs, every later one runs too, since later steps read what earlier ones wrote.
+step whose stamp matches (same discs, output directory and builder fingerprint, outputs still there); --rebuild
+ignores the stamps. Once a step runs, every later one runs too, since later steps read what earlier ones wrote.
+The data directory counts as built only once <out>/.built is there: it is removed when a build starts and
+written after the last step, with the fingerprint, so a build that stopped part way never looks finished.
 """
+import datetime
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -17,6 +21,25 @@ sys.path.insert(0, HERE)
 import egs  # noqa: E402
 
 LOBBY_AFS = {"psu": "XF_QE_OFF_EXTRA_LOBBY01.AFS", "aoti": "XF_QE_OFF_LOBBY_ILLUMINUS.AFS"}
+BUILT = ".built"
+# Not copied into the extract image (.dockerignore), so not part of the fingerprint.
+UNHASHED = ("Dockerfile", ".dockerignore")
+
+
+def fingerprint(top=HERE):
+    """A hash of the builder's own files (the tools, the overlay, egs-build.sh and the pinned EGS commit in
+    egs.py). setup.py computes the same over the server folder's extract/ to tell whether the data is current."""
+    h = hashlib.sha256()
+    for base, dirs, files in os.walk(top):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for name in sorted(files):
+            if name.endswith(".pyc") or (base == top and name in UNHASHED):
+                continue
+            path = os.path.join(base, name)
+            h.update(os.path.relpath(path, top).replace(os.sep, "/").encode() + b"\0")
+            with open(path, "rb") as f:
+                h.update(hashlib.sha256(f.read()).digest())
+    return h.hexdigest()
 
 
 class Build:
@@ -26,6 +49,7 @@ class Build:
         self.work = os.path.abspath(work)
         self.egs_src = egs_src
         self.dirty = rebuild
+        self.code = fingerprint()
         self.env = dict(os.environ, PSU_EXTRACT_WORK=self.work, PYTHONDONTWRITEBYTECODE="1")
 
     # paths
@@ -50,8 +74,8 @@ class Build:
     def step(self, name, outputs, fn, *inputs):
         """Run fn() unless the stamp for name matches and every output exists."""
         stamp = os.path.join(self.work, "stamps", name + ".json")
-        sig = {"out": self.out, "inputs": [self.disc_key(g) if g in self.discs else g
-                                                               for g in inputs]}
+        sig = {"out": self.out, "code": self.code,
+               "inputs": [self.disc_key(g) if g in self.discs else g for g in inputs]}
         if not self.dirty and os.path.exists(stamp) and all(os.path.exists(p) for p in outputs):
             with open(stamp, encoding="utf-8") as f:
                 if json.load(f) == sig:
@@ -64,8 +88,9 @@ class Build:
         if missing:
             raise SystemExit(f"extract: {name} did not write {', '.join(missing)}")
         os.makedirs(os.path.dirname(stamp), exist_ok=True)
-        with open(stamp, "w", encoding="utf-8") as f:
+        with open(stamp + ".tmp", "w", encoding="utf-8") as f:
             json.dump(sig, f)
+        os.replace(stamp + ".tmp", stamp)
 
     def disc_key(self, game):
         st = os.stat(self.iso(game))
@@ -73,6 +98,19 @@ class Build:
 
     # steps
     def run(self):
+        marker = os.path.join(self.out, BUILT)
+        if os.path.exists(marker):
+            os.remove(marker)
+        self.steps()
+        info = {"fingerprint": self.code, "egs": egs.COMMIT,
+                "discs": {g: self.discs[g][1]["serial"] for g in sorted(self.discs)},
+                "built_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+        with open(marker + ".tmp", "w", encoding="utf-8", newline="\n") as f:
+            json.dump(info, f, indent=1)
+            f.write("\n")
+        os.replace(marker + ".tmp", marker)
+
+    def steps(self):
         games = [g for g in ("psu", "aoti") if g in self.discs]
         for g in games:
             self.step(f"{g}-disc", [os.path.join(self.work, g, "erx", "PSU_US.erx")], lambda g=g: self.disc(g), g)
