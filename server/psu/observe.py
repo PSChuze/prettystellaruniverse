@@ -31,6 +31,13 @@ PORTS = [int(p) for p in os.environ.get("PSU_OBSERVE_PORTS", "11110,11140,12110,
 LOG_DIR = os.environ.get("PSU_LOG_DIR", os.path.join(os.getcwd(), "logs"))
 GREETING = bytes.fromhex(os.environ.get("PSU_OBSERVE_GREETING", ""))
 IDLE = float(os.environ.get("PSU_IDLE_SECS", "600"))
+# server-sent packets dump only their first bytes to the session logs (0 = all): a zone download is disc data
+# and hexdumping it whole was most of a login's CPU time with a full lobby
+HEX_SENT = int(os.environ.get("PSU_LOG_HEX_SENT", "256"))
+# walking (0x0503 / 0x0514 / 0x0102 on channel 1, a few a second per player) stays out of the session logs and
+# events.jsonl unless set: with a full lobby it was most of what was logged (tools/bot.py --replay needs it)
+LOG_MOVES = os.environ.get("PSU_LOG_MOVES", "") not in ("", "0")
+MOVES = (0x0503, 0x0514, 0x0102)
 
 ROLE = {11110: "psu-patch", 12110: "psu-login", 11140: "aoti-patch", 12140: "aoti-login",
         11200: "x360-patch"}
@@ -52,13 +59,17 @@ def now():
     return dt.datetime.now(dt.timezone.utc)
 
 
-def hexdump(data, width=16):
+def hexdump(data, width=16, limit=0):
+    """limit > 0: only the first `limit` bytes, then a line with how many were left out."""
     out = []
-    for i in range(0, len(data), width):
-        chunk = data[i:i + width]
+    end = min(len(data), limit) if limit > 0 else len(data)
+    for i in range(0, end, width):
+        chunk = data[i:min(i + width, end)]
         hx = " ".join(f"{b:02x}" for b in chunk)
         asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
         out.append(f"  {i:06x}  {hx:<{width * 3}} {asc}")
+    if end < len(data):
+        out.append(f"  ... {len(data) - end} more bytes")
     return "\n".join(out)
 
 
@@ -87,11 +98,20 @@ def client_hello(data):
     return None
 
 
+_events = None             # events.jsonl, kept open (line buffered): an open per line was a big share of the CPU
+
+
 def event(**kw):
+    global _events
     kw["t"] = now().isoformat()
-    with open(os.path.join(LOG_DIR, "events.jsonl"), "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(kw) + "\n")
-    print(json.dumps(kw), flush=True)
+    line = json.dumps(kw)
+    try:
+        if _events is None:
+            _events = open(os.path.join(LOG_DIR, "events.jsonl"), "a", encoding="utf-8", buffering=1)
+        _events.write(line + "\n")
+    except (OSError, ValueError):
+        _events = None
+    print(line, flush=True)
 
 
 async def session(reader, writer, port):

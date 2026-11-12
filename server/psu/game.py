@@ -37,7 +37,8 @@ holds the session loop and dispatches to them. Characters are stored as their ra
 progression state in psu.db (psu/db.py). The 0x020D key is the one-time key login.py put in the shared DB.
 
 Env: PSU_GAME_PORTS (default 22061; `host:port` binds that item elsewhere), PSU_STATE_DIR (default <log dir>/../state), plus
-PSU_BIND / PSU_LOG_DIR / PSU_IDLE_SECS.
+PSU_BIND / PSU_LOG_DIR / PSU_IDLE_SECS. Session logs: PSU_LOG_HEX_SENT (bytes of each sent packet to hexdump,
+default 256, 0 = all), PSU_LOG_MOVES=1 (also log walking packets; tools/bot.py --replay reads them).
 """
 import asyncio
 import json
@@ -57,7 +58,7 @@ from psu.world import (CASTS, WORLD, Player, c0111_spawn, c0204_unspawn, c0233_p
 from psu.area import COUNTER_QUEST, LOBBY_QUESTS, user_bin, c010d_char, LOBBY, area_sequence, available, counter_sequence, resolve, lobby_sequence, location_sequence
 from psu.charload import UNIVERSES, c021e_universe_list, c0230_leave_area, c0d01_character, c0d04_ack, char_load_sequence, lobby_counter_work, slot_record, story_flag
 from psu.login import TAG, hello, packet
-from psu.observe import LOG_DIR, IDLE, event, hexdump, listen_spec, now
+from psu.observe import HEX_SENT, LOG_DIR, LOG_MOVES, IDLE, MOVES, event, hexdump, listen_spec, now
 from psu import admin, adminport, board, events, presence
 
 LISTEN = listen_spec("PSU_GAME_PORTS", "22061")
@@ -211,7 +212,8 @@ async def session(reader, writer, port):
     event(ev="open", sid=sid, peer=peer[0], port=port, role="psu-game")
     with open(os.path.join(LOG_DIR, "sessions", sid + ".log"), "a", encoding="utf-8") as log:
         def record(direction, data):
-            log.write(f"{now().isoformat()} {direction} {len(data)} bytes\n{hexdump(data)}\n")
+            dump = hexdump(data, limit=HEX_SENT if direction == "S>C" else 0)
+            log.write(f"{now().isoformat()} {direction} {len(data)} bytes\n{dump}\n")
             log.flush()
 
         lock = asyncio.Lock()       # one writer at a time: this session and relays from other players
@@ -336,7 +338,6 @@ async def session(reader, writer, port):
                     continue
                 if not data:
                     return False
-                record("C>S", data)
                 buf += data
 
         async def send_paced(data, what):
@@ -531,7 +532,9 @@ async def session(reader, writer, port):
                     pkt, buf = buf[:size], buf[size:]
                     cmd, = struct.unpack_from(">H", pkt, 4)
                     body = pkt[8:]
-                    event(ev="recv", sid=sid, cmd=f"{cmd:#06x}", channel=pkt[6], size=size, body=body[:96].hex())
+                    if LOG_MOVES or not (pkt[6] == 1 and cmd in MOVES):
+                        record("C>S", pkt)
+                        event(ev="recv", sid=sid, cmd=f"{cmd:#06x}", channel=pkt[6], size=size, body=body[:96].hex())
                     try:
                         if pkt[6] == 1 and cmd in CASTS and me is not None and me.zone is not None:
                             if cmd == 0x0102 and len(body) >= 0x4C:     # where the player stands (for newcomers)
@@ -609,7 +612,7 @@ async def session(reader, writer, port):
                             raw = load_characters(gid).get(slot) if selected else None
                             if raw:
                                 if me is None:
-                                    me = Player(gid, raw, writer, send)
+                                    me = Player(gid, raw, writer, send, lock)
                                     me.uni = uni if uni in dict(UNIVERSES) else UNIVERSES[0][0]
                                     WORLD.online[gid] = me
                                     me.warp, me.run_job = warp_to, run_job
@@ -1587,7 +1590,6 @@ async def session(reader, writer, port):
                     continue
                 if not data:
                     break
-                record("C>S", data)
                 buf += data
         except asyncio.TimeoutError:
             log.write(f"{now().isoformat()} idle timeout\n")

@@ -38,17 +38,22 @@ def u32(v):
     return struct.pack("<I", v)
 
 
+RELAY_BUFFER = 256 * 1024          # above this a receiver's relays wait for drain() again (a stalled client)
+RELAY_BACKLOG = 2000               # relays queued for one receiver past which its quiet ones are dropped
+
+
 class Player:
-    def __init__(self, gid, raw, writer, send_raw):
+    def __init__(self, gid, raw, writer, send_raw, lock=None):
         self.gid, self.raw, self.writer = gid, raw, writer
         self.send_raw = send_raw          # async (data, what): write under this player's lock
+        self.lock = lock or asyncio.Lock()   # the session's writer lock (send_raw takes it)
+        self.queued = 0                   # relays waiting for that lock
         self.uni = 1                      # universe (Uni-cube); zones are per universe
         self.zone = None                  # (universe, quest, zone) the player is registered in
         self.lid = 0
         self.area, self.entry = None, 0   # (quest, zone, map)
         self.pos = (0.0, 0.0, 0.0, 0.0)
         self.areanb = 0
-        self.lock = asyncio.Lock()
         self.party = None                 # social.Party
         self.state = None                 # progression/inventory state (db characters.state)
         self.game = games.current()       # "psu" / "aoti": the disc this player runs (psu/games.py)
@@ -99,10 +104,22 @@ class World:
             await dest.send_raw(data, what, quiet)
         except (ConnectionError, OSError):
             pass
+        finally:
+            dest.queued -= 1
 
     def relay(self, dest, data, what, quiet=False):
         """Fire and forget: a receiver busy with a fragmented download must not stall the sender.
-        asyncio.Lock is FIFO, so packets to one receiver keep their order."""
+        asyncio.Lock is FIFO, so packets to one receiver keep their order. A quiet packet (movement, status
+        ticks) to a receiver with nothing queued, a free writer and a small send buffer is written at once: a
+        task per packet was most of the CPU with a full lobby walking."""
+        t = dest.writer.transport
+        if (quiet and dest.queued == 0 and not dest.lock.locked() and not t.is_closing()
+                and t.get_write_buffer_size() < RELAY_BUFFER):
+            dest.writer.write(data)
+            return
+        if quiet and dest.queued > RELAY_BACKLOG:     # it cannot keep up: movement is stale by now anyway
+            return
+        dest.queued += 1
         asyncio.get_running_loop().create_task(self.post(dest, data, what, quiet))
 
 
