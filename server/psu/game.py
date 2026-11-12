@@ -1063,6 +1063,8 @@ async def session(reader, writer, port):
                             if ok:
                                 party_ = me.party
                                 owner = party_.slots[party_.leader].gid if party_ is not None else gid
+                                if owner == gid:                   # the leader / solo player: a new run
+                                    judge.new_run(me.uni, qid, owner, list(WORLD.zones))
                                 mission = {"qid": qid, "origin": prev, "in": False, "start_pending": False, "owner": owner}
                                 await send(missions.c1020(gid), "0x1020")
                                 await send_paced(missions.c1015(gid, qid), f"0x1015 mission {qid}")
@@ -1163,7 +1165,7 @@ async def session(reader, writer, port):
                             new_raw = econ.apply_lumilass(me.raw, body)
                             me.raw = new_raw
                             nm = new_raw[0x28:0x68].decode("utf-16-le", "replace").split("\0")[0]
-                            dbm.get(STATE_DIR).save_character(gid, slot, nm, new_raw)
+                            dbm.get(STATE_DIR).save_look(gid, slot, nm, new_raw)
                             event(ev="lumilass", sid=sid, entry=struct.unpack_from("<I", body, 0x2C)[0])
                             for d in WORLD.others(me):             # others rebuild the model from a fresh 0x010D
                                 WORLD.relay(d, world_c010d(d, me), "0x010d appearance")

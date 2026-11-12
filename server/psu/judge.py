@@ -44,6 +44,13 @@ ACC = bytes.fromhex("00011300")
 runs = {}               # (universe, quest, owner) -> {"t0", "kills", "deaths", "started", "cleared"}
 
 
+def new_run(uni, qid, owner, live_zones):
+    """A fresh accept: forget the last run of this mission by this owner (else a repeat never starts or
+    clears), unless someone is still inside one of its zones (live_zones: world zone keys in use)."""
+    if not any(k[0] == uni and k[1] == qid and isinstance(k[2], tuple) and k[2][1] == owner for k in live_zones):
+        runs.pop((uni, qid, owner), None)
+
+
 def run(uni, qid, owner):
     return runs.setdefault((uni, qid, owner), {"t0": None, "kills": 0, "deaths": 0, "apc_downs": {},
                                                 "started": False, "cleared": False})

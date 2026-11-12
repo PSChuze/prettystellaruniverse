@@ -191,7 +191,10 @@ def zone_enemies(zone):
 
 
 def clear_zone(zone):
+    """The zone emptied (its instance flags go too): its gateways' waves can clear again on the next run."""
     fights.pop(zone, None)
+    for g in _gates.get(zone_ids(zone), []):
+        g.get("cleared_sent", set()).discard(zone)
 
 
 # --- conditions ---------------------------------------------------------------------

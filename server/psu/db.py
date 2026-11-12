@@ -286,6 +286,10 @@ class DB:
                        "ON CONFLICT (gid, slot) DO UPDATE SET name = excluded.name, raw = excluded.raw, state = '{}'",
                        (gid, slot, name, raw, time.time()))
 
+    def save_look(self, gid, slot, name, raw):
+        """Lumilass: new appearance, the stored state kept (save_character's upsert resets it)."""
+        self.c.execute("UPDATE characters SET name = ?, raw = ? WHERE gid = ? AND slot = ?", (name, raw, gid, slot))
+
     def char_state(self, gid, slot):
         row = self.c.execute("SELECT state FROM characters WHERE gid = ? AND slot = ?", (gid, slot)).fetchone()
         return json.loads(row[0]) if row else {}
